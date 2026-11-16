@@ -45,6 +45,19 @@ object EventRecorder {
         listener = callback
     }
 
+    fun refreshFromDisk() {
+        synchronized(lock) {
+            val file = logFile
+            if (file != null && file.isFile) {
+                runCatching {
+                    val latestEntries = file.readLines().takeLast(MAX_MEMORY_ENTRIES)
+                    entries.clear()
+                    entries.addAll(latestEntries)
+                }
+            }
+        }
+    }
+
     fun record(level: String, source: String, message: String) {
         val callback: (() -> Unit)?
         synchronized(lock) {
