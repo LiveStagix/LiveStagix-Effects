@@ -291,6 +291,7 @@ private:
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat swapchainFormat_ = VK_FORMAT_UNDEFINED;
+    VkFormat pipelineFormat_ = VK_FORMAT_UNDEFINED;
     VkExtent2D swapchainExtent_{};
     std::vector<VkImage> swapchainImages_;
     std::vector<VkImageView> imageViews_;
@@ -955,8 +956,25 @@ private:
         );
 
         createImageViews();
-        createRenderPass();
-        createGraphicsPipeline();
+
+        const bool pipelineCanBeReused =
+            pipelineFormat_ == swapchainFormat_ &&
+            renderPass_ != VK_NULL_HANDLE &&
+            pipelineLayout_ != VK_NULL_HANDLE &&
+            graphicsPipeline_ != VK_NULL_HANDLE;
+
+        if (pipelineCanBeReused) {
+            emitLog(
+                "INFO",
+                "Reusing graphics pipeline and render pass; swapchain format is unchanged"
+            );
+        } else {
+            destroyPipelineResources();
+            createRenderPass();
+            createGraphicsPipeline();
+            pipelineFormat_ = swapchainFormat_;
+        }
+
         createFramebuffers();
         createCommandBuffers();
         createRenderFinishedSemaphores();
@@ -1397,7 +1415,7 @@ private:
         }
 
         requireVk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(swapchain recreation)");
-        cleanupSwapchain();
+        cleanupSwapchain(true);
         createSwapchainResources();
 
         std::ostringstream resultDetails;
@@ -1704,7 +1722,23 @@ private:
         }
     }
 
-    void cleanupSwapchain() {
+    void destroyPipelineResources() {
+        if (graphicsPipeline_ != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device_, graphicsPipeline_, nullptr);
+            graphicsPipeline_ = VK_NULL_HANDLE;
+        }
+        if (pipelineLayout_ != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
+            pipelineLayout_ = VK_NULL_HANDLE;
+        }
+        if (renderPass_ != VK_NULL_HANDLE) {
+            vkDestroyRenderPass(device_, renderPass_, nullptr);
+            renderPass_ = VK_NULL_HANDLE;
+        }
+        pipelineFormat_ = VK_FORMAT_UNDEFINED;
+    }
+
+    void cleanupSwapchain(bool preservePipelineResources = false) {
         if (device_ == VK_NULL_HANDLE) return;
 
         std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
@@ -1728,17 +1762,8 @@ private:
         }
         framebuffers_.clear();
 
-        if (graphicsPipeline_ != VK_NULL_HANDLE) {
-            vkDestroyPipeline(device_, graphicsPipeline_, nullptr);
-            graphicsPipeline_ = VK_NULL_HANDLE;
-        }
-        if (pipelineLayout_ != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
-            pipelineLayout_ = VK_NULL_HANDLE;
-        }
-        if (renderPass_ != VK_NULL_HANDLE) {
-            vkDestroyRenderPass(device_, renderPass_, nullptr);
-            renderPass_ = VK_NULL_HANDLE;
+        if (!preservePipelineResources) {
+            destroyPipelineResources();
         }
 
         for (VkImageView imageView : imageViews_) {
