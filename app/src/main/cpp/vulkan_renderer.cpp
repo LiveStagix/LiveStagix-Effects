@@ -1189,6 +1189,10 @@ private:
             }
 
             if (wasPaused) {
+                sampleStart = Clock::now();
+                sampleFrames = 0;
+                sampleFrameMs = 0.0;
+
                 emitLog("INFO", "Renderer resumed");
                 wasPaused = false;
                 requestResize(
