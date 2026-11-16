@@ -195,8 +195,58 @@ public:
         }
     }
 
-    void requestResize() {
-        resizeRequested_.store(true);
+    void requestResize(int width, int height) {
+        if (width <= 0 || height <= 0) {
+            emitLog(
+                "WARN",
+                "Ignoring invalid Android surface size request: " +
+                    std::to_string(width) + "x" + std::to_string(height)
+            );
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(resizeMutex_);
+            pendingResizeWidth_ = width;
+            pendingResizeHeight_ = height;
+            resizeRequestedAt_ = std::chrono::steady_clock::now();
+            resizePending_ = true;
+        }
+
+        emitLog(
+            "DEBUG",
+            "Android surface resize requested: " +
+                std::to_string(width) + "x" + std::to_string(height) +
+                " | waiting 100 ms for resize to settle"
+        );
+    }
+
+    bool takeStableResizeRequest(int& width, int& height) {
+        std::lock_guard<std::mutex> lock(resizeMutex_);
+        if (!resizePending_) {
+            return false;
+        }
+
+        const auto elapsed = std::chrono::steady_clock::now() - resizeRequestedAt_;
+        if (elapsed < std::chrono::milliseconds(100)) {
+            return false;
+        }
+
+        width = pendingResizeWidth_;
+        height = pendingResizeHeight_;
+        resizePending_ = false;
+        return true;
+    }
+
+    bool hasPendingResizeRequest() {
+        std::lock_guard<std::mutex> lock(resizeMutex_);
+        return resizePending_;
+    }
+
+    void getLatestResizeRequest(int& width, int& height) {
+        std::lock_guard<std::mutex> lock(resizeMutex_);
+        width = pendingResizeWidth_;
+        height = pendingResizeHeight_;
     }
 
     void setPaused(bool paused) {
@@ -209,7 +259,12 @@ private:
     std::thread renderThread_;
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> paused_{false};
-    std::atomic<bool> resizeRequested_{false};
+
+    std::mutex resizeMutex_;
+    int pendingResizeWidth_ = 0;
+    int pendingResizeHeight_ = 0;
+    std::chrono::steady_clock::time_point resizeRequestedAt_{};
+    bool resizePending_ = false;
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
@@ -1063,31 +1118,51 @@ private:
         );
     }
 
-    bool recreateSwapchain() {
-        const int width = ANativeWindow_getWidth(window_);
-        const int height = ANativeWindow_getHeight(window_);
-        if (width <= 0 || height <= 0) {
-            emitLog("WARN", "Swapchain recreation delayed because the surface has zero size");
+    bool recreateSwapchain(int requestedWidth, int requestedHeight, bool force) {
+        const int nativeWidth = ANativeWindow_getWidth(window_);
+        const int nativeHeight = ANativeWindow_getHeight(window_);
+
+        if (requestedWidth <= 0) requestedWidth = nativeWidth;
+        if (requestedHeight <= 0) requestedHeight = nativeHeight;
+
+        std::ostringstream requestDetails;
+        requestDetails << "Swapchain resize check: requested="
+                       << requestedWidth << "x" << requestedHeight
+                       << " | nativeWindow=" << nativeWidth << "x" << nativeHeight
+                       << " | currentVulkan=" << swapchainExtent_.width << "x"
+                       << swapchainExtent_.height
+                       << " | forced=" << (force ? "yes" : "no");
+        emitLog("INFO", requestDetails.str());
+
+        if (requestedWidth <= 0 || requestedHeight <= 0 ||
+            nativeWidth <= 0 || nativeHeight <= 0) {
+            emitLog("WARN", "Swapchain recreation delayed because the native window has zero size");
             return false;
         }
 
-        if (swapchain_ != VK_NULL_HANDLE &&
-            static_cast<uint32_t>(width) == swapchainExtent_.width &&
-            static_cast<uint32_t>(height) == swapchainExtent_.height) {
-            emitLog("DEBUG", "Swapchain recreation skipped; surface extent is unchanged");
+        if (!force &&
+            swapchain_ != VK_NULL_HANDLE &&
+            static_cast<uint32_t>(requestedWidth) == swapchainExtent_.width &&
+            static_cast<uint32_t>(requestedHeight) == swapchainExtent_.height) {
+            emitLog(
+                "DEBUG",
+                "Swapchain recreation skipped; requested size matches the current Vulkan extent"
+            );
             return true;
         }
 
-        requireVk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(resize)");
+        requireVk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(swapchain recreation)");
         cleanupSwapchain();
         createSwapchainResources();
 
-        emitLog(
-            "INFO",
-            "Swapchain recreated for surface size " +
-                std::to_string(swapchainExtent_.width) + "x" +
-                std::to_string(swapchainExtent_.height)
-        );
+        std::ostringstream resultDetails;
+        resultDetails << "Swapchain recreation completed: requested="
+                      << requestedWidth << "x" << requestedHeight
+                      << " | nativeWindow=" << ANativeWindow_getWidth(window_) << "x"
+                      << ANativeWindow_getHeight(window_)
+                      << " | Vulkan selected=" << swapchainExtent_.width << "x"
+                      << swapchainExtent_.height;
+        emitLog("INFO", resultDetails.str());
         return true;
     }
 
@@ -1097,6 +1172,10 @@ private:
         uint64_t sampleFrames = 0;
         double sampleFrameMs = 0.0;
         bool wasPaused = false;
+        bool swapchainOutOfDate = false;
+        bool acquireSuboptimalLogged = false;
+        bool presentSuboptimalLogged = false;
+        auto lastForcedRecreation = Clock::time_point::min();
 
         while (!stopRequested_.load()) {
             if (paused_.load()) {
@@ -1112,13 +1191,61 @@ private:
             if (wasPaused) {
                 emitLog("INFO", "Renderer resumed");
                 wasPaused = false;
-                resizeRequested_.store(true);
+                requestResize(
+                    ANativeWindow_getWidth(window_),
+                    ANativeWindow_getHeight(window_)
+                );
             }
 
-            if (resizeRequested_.exchange(false)) {
-                if (!recreateSwapchain()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (swapchainOutOfDate) {
+                int requestedWidth = 0;
+                int requestedHeight = 0;
+
+                if (!takeStableResizeRequest(requestedWidth, requestedHeight)) {
+                    if (hasPendingResizeRequest()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        continue;
+                    }
+                    getLatestResizeRequest(requestedWidth, requestedHeight);
+                }
+
+                const auto now = Clock::now();
+                if (lastForcedRecreation != Clock::time_point::min() &&
+                    now - lastForcedRecreation < std::chrono::milliseconds(100)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
                     continue;
+                }
+
+                emitLog(
+                    "WARN",
+                    "Forcing swapchain recreation after VK_ERROR_OUT_OF_DATE_KHR"
+                );
+                if (!recreateSwapchain(requestedWidth, requestedHeight, true)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+
+                lastForcedRecreation = Clock::now();
+                swapchainOutOfDate = false;
+                acquireSuboptimalLogged = false;
+                presentSuboptimalLogged = false;
+                continue;
+            }
+
+            int requestedWidth = 0;
+            int requestedHeight = 0;
+            if (takeStableResizeRequest(requestedWidth, requestedHeight)) {
+                const VkExtent2D previousExtent = swapchainExtent_;
+                if (!recreateSwapchain(requestedWidth, requestedHeight, false)) {
+                    requestResize(requestedWidth, requestedHeight);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+
+                if (previousExtent.width != swapchainExtent_.width ||
+                    previousExtent.height != swapchainExtent_.height) {
+                    acquireSuboptimalLogged = false;
+                    presentSuboptimalLogged = false;
                 }
             }
 
@@ -1130,7 +1257,7 @@ private:
             );
 
             uint32_t imageIndex = 0;
-            VkResult acquireResult = vkAcquireNextImageKHR(
+            const VkResult acquireResult = vkAcquireNextImageKHR(
                 device_,
                 swapchain_,
                 UINT64_MAX,
@@ -1140,10 +1267,24 @@ private:
             );
 
             if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
-                resizeRequested_.store(true);
+                emitLog(
+                    "WARN",
+                    "vkAcquireNextImageKHR returned VK_ERROR_OUT_OF_DATE_KHR"
+                );
+                swapchainOutOfDate = true;
                 continue;
             }
-            if (acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR) {
+
+            if (acquireResult == VK_SUBOPTIMAL_KHR) {
+                if (!acquireSuboptimalLogged) {
+                    emitLog(
+                        "WARN",
+                        "vkAcquireNextImageKHR returned VK_SUBOPTIMAL_KHR; "
+                        "the image is usable, continuing until a resize or mandatory recovery"
+                    );
+                    acquireSuboptimalLogged = true;
+                }
+            } else if (acquireResult != VK_SUCCESS) {
                 requireVk(acquireResult, "vkAcquireNextImageKHR");
             }
 
@@ -1184,11 +1325,24 @@ private:
             presentInfo.pImageIndices = &imageIndex;
 
             const VkResult presentResult = vkQueuePresentKHR(presentQueue_, &presentInfo);
-            if (presentResult == VK_ERROR_OUT_OF_DATE_KHR ||
-                presentResult == VK_SUBOPTIMAL_KHR ||
-                acquireResult == VK_SUBOPTIMAL_KHR) {
-                emitLog("WARN", "Surface reported an out-of-date or suboptimal swapchain");
-                resizeRequested_.store(true);
+            if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
+                emitLog(
+                    "WARN",
+                    "vkQueuePresentKHR returned VK_ERROR_OUT_OF_DATE_KHR"
+                );
+                swapchainOutOfDate = true;
+                continue;
+            }
+
+            if (presentResult == VK_SUBOPTIMAL_KHR) {
+                if (!presentSuboptimalLogged) {
+                    emitLog(
+                        "WARN",
+                        "vkQueuePresentKHR returned VK_SUBOPTIMAL_KHR; "
+                        "presentation can continue, waiting for a resize or mandatory recovery"
+                    );
+                    presentSuboptimalLogged = true;
+                }
             } else if (presentResult != VK_SUCCESS) {
                 requireVk(presentResult, "vkQueuePresentKHR");
             }
@@ -1379,11 +1533,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_livestagix_vulkantest_MainActivity_nativeResize(
     JNIEnv*,
     jobject,
-    jint,
-    jint
+    jint width,
+    jint height
 ) {
     std::lock_guard<std::mutex> lock(gRendererMutex);
-    if (gRenderer != nullptr) gRenderer->requestResize();
+    if (gRenderer != nullptr) gRenderer->requestResize(width, height);
 }
 
 extern "C" JNIEXPORT void JNICALL
