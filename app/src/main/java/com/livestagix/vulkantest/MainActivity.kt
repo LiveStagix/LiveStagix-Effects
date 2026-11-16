@@ -10,6 +10,8 @@ import android.content.Intent
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.widget.Button
 import android.widget.LinearLayout
@@ -22,6 +24,8 @@ class MainActivity : Activity() {
     private lateinit var statusLabel: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var wallpaperReturnVerificationRunnable: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -79,7 +83,7 @@ class MainActivity : Activity() {
         ))
 
         val previewButton = Button(this).apply {
-            text = "Preview LiveStagix wallpaper"
+            text = "Set as Live Wallpaper"
             setOnClickListener { openWallpaperPreview() }
         }
         root.addView(previewButton, LinearLayout.LayoutParams(
@@ -146,28 +150,148 @@ class MainActivity : Activity() {
 
     private fun openWallpaperPreview() {
         val service = ComponentName(this, VulkanWallpaperService::class.java)
-        val previewIntent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+        val setupIntent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
             putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, service)
         }
 
-        statusLabel.text = "Opening Android wallpaper preview..."
-        EventRecorder.record("INFO", "APP", "Opening Android live wallpaper preview")
+        armWallpaperReturnVerification()
+        statusLabel.text = "Opening Android wallpaper setup..."
+        EventRecorder.record(
+            "INFO",
+            "APP",
+            "Launching Android live-wallpaper setup; component=${service.flattenToShortString()}"
+        )
 
         runCatching {
-            startActivity(previewIntent)
+            startActivity(setupIntent)
         }.onFailure {
-            statusLabel.text = "Could not open wallpaper preview"
+            wallpaperSetupPreferences().edit()
+                .putBoolean(PREF_RETURN_VERIFY_ARMED, false)
+                .putBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
+                .putString(PREF_RETURN_VERIFY_STATE, "idle")
+                .apply()
+            statusLabel.text = "Could not open wallpaper setup"
             EventRecorder.record(
                 "ERROR",
                 "APP",
-                "Could not open Android wallpaper preview: ${it.message}"
+                "Could not open Android wallpaper setup: ${it.message}"
             )
-            Toast.makeText(
-                this,
-                "Could not open wallpaper preview",
-                Toast.LENGTH_SHORT
-            ).show()
+            Toast.makeText(this, "Could not open wallpaper setup", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun wallpaperSetupPreferences() =
+        getSharedPreferences(PREF_WALLPAPER_SETUP, MODE_PRIVATE)
+
+    private fun armWallpaperReturnVerification() {
+        wallpaperSetupPreferences().edit()
+            .putBoolean(PREF_RETURN_VERIFY_ARMED, true)
+            .putBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
+            .putString(PREF_RETURN_VERIFY_STATE, "armed")
+            .putBoolean(PREF_SETUP_SUCCEEDED, false)
+            .putLong(PREF_SETUP_COMPLETED_AT, 0L)
+            .apply()
+        EventRecorder.record("INFO", "VERIFY", "Wallpaper return verification armed")
+    }
+
+    private fun markWallpaperSetupBackgrounded() {
+        val prefs = wallpaperSetupPreferences()
+        if (prefs.getBoolean(PREF_RETURN_VERIFY_ARMED, false)) {
+            prefs.edit().putBoolean(PREF_RETURN_VERIFY_BACKGROUND, true).apply()
+            EventRecorder.record("INFO", "VERIFY", "App backgrounded while wallpaper setup was armed")
+        }
+    }
+
+    private fun startWallpaperReturnVerificationAfterResume() {
+        val prefs = wallpaperSetupPreferences()
+        val armed = prefs.getBoolean(PREF_RETURN_VERIFY_ARMED, false)
+        val backgrounded = prefs.getBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
+        val state = prefs.getString(PREF_RETURN_VERIFY_STATE, "idle")
+        val recoveringInterruptedCheck = state == "verifying"
+
+        if (!(armed && backgrounded) && !recoveringInterruptedCheck) return
+        if (wallpaperReturnVerificationRunnable != null) return
+
+        prefs.edit()
+            .putBoolean(PREF_RETURN_VERIFY_ARMED, false)
+            .putBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
+            .putString(PREF_RETURN_VERIFY_STATE, "verifying")
+            .apply()
+
+        EventRecorder.record(
+            "INFO",
+            "VERIFY",
+            "Returned from Android wallpaper setup; checking applied wallpaper in 3 seconds"
+        )
+
+        val verification = Runnable {
+            try {
+                val manager = WallpaperManager.getInstance(this)
+                val expected = ComponentName(this, VulkanWallpaperService::class.java)
+                val home = manager.getWallpaperInfo(WallpaperManager.FLAG_SYSTEM)
+                val lock = manager.getWallpaperInfo(WallpaperManager.FLAG_LOCK)
+                val ownsHome = home?.component == expected
+                var ownsLock = lock?.component == expected
+
+                // Android may not expose separate Lock WallpaperInfo when Home and Lock share one wallpaper.
+                if (ownsHome && !ownsLock) {
+                    ownsLock = runCatching {
+                        manager.getWallpaperId(WallpaperManager.FLAG_LOCK) < 0
+                    }.getOrElse {
+                        EventRecorder.record(
+                            "WARN",
+                            "VERIFY",
+                            "Could not confirm shared Lock wallpaper ownership: ${it.message}"
+                        )
+                        false
+                    }
+                }
+
+                val succeeded = ownsHome && ownsLock
+                val completedAt = System.currentTimeMillis()
+                prefs.edit()
+                    .putString(PREF_RETURN_VERIFY_STATE, "completed")
+                    .putBoolean(PREF_SETUP_SUCCEEDED, succeeded)
+                    .putBoolean(PREF_OWNERSHIP_CHECK_SUCCEEDED, true)
+                    .putBoolean(PREF_OWNS_HOME, ownsHome)
+                    .putBoolean(PREF_OWNS_LOCK, ownsLock)
+                    .putLong(PREF_SETUP_COMPLETED_AT, completedAt)
+                    .apply()
+
+                statusLabel.text = if (succeeded) {
+                    "Wallpaper applied and verified"
+                } else {
+                    "Setup returned — wallpaper was not applied"
+                }
+                EventRecorder.record(
+                    if (succeeded) "INFO" else "WARN",
+                    "VERIFY",
+                    "Wallpaper ownership check completed: ownsHome=${ownsHome}, ownsLock=${ownsLock}, setupSucceeded=${succeeded}"
+                )
+            } catch (error: Throwable) {
+                val completedAt = System.currentTimeMillis()
+                prefs.edit()
+                    .putString(PREF_RETURN_VERIFY_STATE, "completed")
+                    .putBoolean(PREF_SETUP_SUCCEEDED, false)
+                    .putBoolean(PREF_OWNERSHIP_CHECK_SUCCEEDED, false)
+                    .putBoolean(PREF_OWNS_HOME, false)
+                    .putBoolean(PREF_OWNS_LOCK, false)
+                    .putLong(PREF_SETUP_COMPLETED_AT, completedAt)
+                    .apply()
+                statusLabel.text = "Could not verify wallpaper setup"
+                EventRecorder.record(
+                    "ERROR",
+                    "VERIFY",
+                    "Wallpaper ownership verification failed: ${error.message}"
+                )
+            } finally {
+                wallpaperReturnVerificationRunnable = null
+                refreshLogs()
+            }
+        }
+
+        wallpaperReturnVerificationRunnable = verification
+        mainHandler.postDelayed(verification, WALLPAPER_RETURN_VERIFICATION_DELAY_MS)
     }
 
     private fun logVulkanFeatures() {
@@ -196,21 +320,28 @@ class MainActivity : Activity() {
 
     private fun refreshLogs() {
         if (!::logText.isInitialized) return
+        EventRecorder.refreshFromDisk()
         logText.text = EventRecorder.snapshot().ifBlank { "No events recorded." }
         logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
     override fun onPause() {
+        markWallpaperSetupBackgrounded()
         EventRecorder.record("INFO", "LIFECYCLE", "Activity paused")
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
+        EventRecorder.refreshFromDisk()
         EventRecorder.record("INFO", "LIFECYCLE", "Activity resumed")
+        startWallpaperReturnVerificationAfterResume()
+        refreshLogs()
     }
 
     override fun onDestroy() {
+        wallpaperReturnVerificationRunnable?.let(mainHandler::removeCallbacks)
+        wallpaperReturnVerificationRunnable = null
         EventRecorder.setListener(null)
         if (activeActivity?.get() === this) activeActivity = null
         super.onDestroy()
@@ -220,6 +351,17 @@ class MainActivity : Activity() {
         (value * resources.displayMetrics.density).toInt()
 
     companion object {
+        private const val PREF_WALLPAPER_SETUP = "vulkan_wallpaper_setup"
+        private const val PREF_RETURN_VERIFY_ARMED = "wallpaper_return_verification_armed"
+        private const val PREF_RETURN_VERIFY_BACKGROUND = "wallpaper_return_verification_backgrounded"
+        private const val PREF_RETURN_VERIFY_STATE = "wallpaper_return_verification_state"
+        private const val PREF_SETUP_SUCCEEDED = "wallpaper_return_verification_setup_succeeded"
+        private const val PREF_SETUP_COMPLETED_AT = "wallpaper_return_verification_completed_at"
+        private const val PREF_OWNERSHIP_CHECK_SUCCEEDED = "wallpaper_return_verification_success"
+        private const val PREF_OWNS_HOME = "wallpaper_return_verification_owns_home"
+        private const val PREF_OWNS_LOCK = "wallpaper_return_verification_owns_lock"
+        private const val WALLPAPER_RETURN_VERIFICATION_DELAY_MS = 3_000L
+
         private var activeActivity: WeakReference<MainActivity>? = null
 
         @JvmStatic
