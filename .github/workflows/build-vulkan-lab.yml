@@ -34,6 +34,19 @@ jobs:
         with:
           packages: platform-tools
 
+      - name: Install shader compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y glslc
+
+      - name: Compile Vulkan shaders
+        run: |
+          mkdir -p app/src/main/assets/shaders
+          glslc --target-env=vulkan1.0 app/src/main/shaders/triangle.vert -o app/src/main/assets/shaders/triangle.vert.spv
+          glslc --target-env=vulkan1.0 app/src/main/shaders/triangle.frag -o app/src/main/assets/shaders/triangle.frag.spv
+          test -s app/src/main/assets/shaders/triangle.vert.spv
+          test -s app/src/main/assets/shaders/triangle.frag.spv
+
       - name: Install Android build components
         run: |
           sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
