@@ -1071,6 +1071,13 @@ private:
             return false;
         }
 
+        if (swapchain_ != VK_NULL_HANDLE &&
+            static_cast<uint32_t>(width) == swapchainExtent_.width &&
+            static_cast<uint32_t>(height) == swapchainExtent_.height) {
+            emitLog("DEBUG", "Swapchain recreation skipped; surface extent is unchanged");
+            return true;
+        }
+
         requireVk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(resize)");
         cleanupSwapchain();
         createSwapchainResources();
