@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LiveStagix Vulkan Mock</string>
+    <string name="wallpaper_name">LiveStagix Vulkan Test</string>
+    <string name="wallpaper_description">A test wallpaper using the LiveStagix Vulkan renderer.</string>
+</resources>

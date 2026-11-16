@@ -1504,7 +1504,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_livestagix_vulkantest_MainActivity_nativeStart(
+Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeStart(
     JNIEnv* env,
     jobject,
     jobject surface,
@@ -1534,7 +1534,7 @@ Java_com_livestagix_vulkantest_MainActivity_nativeStart(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_livestagix_vulkantest_MainActivity_nativeResize(
+Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeResize(
     JNIEnv*,
     jobject,
     jint width,
@@ -1545,7 +1545,7 @@ Java_com_livestagix_vulkantest_MainActivity_nativeResize(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_livestagix_vulkantest_MainActivity_nativeSetPaused(
+Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeSetPaused(
     JNIEnv*,
     jobject,
     jboolean paused
@@ -1555,7 +1555,7 @@ Java_com_livestagix_vulkantest_MainActivity_nativeSetPaused(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_livestagix_vulkantest_MainActivity_nativeStop(
+Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeStop(
     JNIEnv*,
     jobject
 ) {

@@ -1,31 +1,27 @@
 package com.livestagix.vulkantest
 
 import android.app.Activity
+import android.app.WallpaperManager
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
-import android.content.res.AssetManager
+import android.content.Intent
 import android.graphics.Color
-import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Bundle
 import android.view.Gravity
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.widget.Button
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import java.lang.ref.WeakReference
 
-class MainActivity : Activity(), SurfaceHolder.Callback {
+class MainActivity : Activity() {
     private lateinit var statusLabel: TextView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
-    private var nativeLibraryLoaded = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,20 +31,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         window.statusBarColor = Color.rgb(10, 12, 18)
         window.navigationBarColor = Color.rgb(10, 12, 18)
 
-        nativeLibraryLoaded = runCatching {
-            System.loadLibrary("vulkan_test")
-            true
-        }.getOrElse {
-            EventRecorder.record("ERROR", "APP", "Could not load native renderer: ${it.message}")
-            false
-        }
-
         buildScreen()
         EventRecorder.record(
             "INFO",
             "DEVICE",
-            "Device=${Build.MANUFACTURER} ${Build.MODEL}; Android API=${Build.VERSION.SDK_INT}; " +
-                "hardware=${Build.HARDWARE}; ABI=${Build.SUPPORTED_ABIS.joinToString()}"
+            "Device=${{Build.MANUFACTURER} ${{Build.MODEL}; Android API=${{Build.VERSION.SDK_INT}; " +
+                "hardware=${{Build.HARDWARE}; ABI=${{Build.SUPPORTED_ABIS.joinToString()}"
         )
         logVulkanFeatures()
 
@@ -56,16 +44,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             EventRecorder.record("INFO", "APP", "Private session log: $it")
         }
 
-        EventRecorder.setListener {
-            refreshLogs()
-        }
+        EventRecorder.setListener { refreshLogs() }
         refreshLogs()
-
-        if (!nativeLibraryLoaded) {
-            statusLabel.text = "Renderer status: native library failed to load"
-        } else {
-            statusLabel.text = "Renderer status: waiting for Android surface"
-        }
+        statusLabel.text = "Ready — preview the Vulkan live wallpaper"
     }
 
     private fun buildScreen() {
@@ -76,43 +57,34 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
 
         val title = TextView(this).apply {
-            text = "LIVESTAGIX VULKAN LAB"
+            text = "LIVESTAGIX VULKAN MOCK"
             textSize = 18f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER_VERTICAL
         }
         root.addView(title, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(34)
+            dp(38)
         ))
 
         statusLabel = TextView(this).apply {
-            text = "Renderer status: preparing"
+            text = "Preparing wallpaper preview"
             textSize = 12f
             setTextColor(Color.rgb(177, 184, 202))
             gravity = Gravity.CENTER_VERTICAL
         }
         root.addView(statusLabel, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(30)
+            dp(34)
         ))
 
-        val surfaceView = SurfaceView(this).apply {
-            holder.setFormat(PixelFormat.OPAQUE)
-            setKeepScreenOn(true)
+        val previewButton = Button(this).apply {
+            text = "Preview LiveStagix wallpaper"
+            setOnClickListener { openWallpaperPreview() }
         }
-        surfaceView.holder.addCallback(this)
-
-        val surfaceFrame = FrameLayout(this).apply {
-            setBackgroundColor(Color.rgb(18, 21, 32))
-            addView(surfaceView, FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            ))
-        }
-        root.addView(surfaceFrame, LinearLayout.LayoutParams(
+        root.addView(previewButton, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(245)
+            dp(52)
         ))
 
         val logHeader = TextView(this).apply {
@@ -123,7 +95,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         root.addView(logHeader, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
-            dp(32)
+            dp(34)
         ))
 
         logText = TextView(this).apply {
@@ -172,10 +144,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         setContentView(root)
     }
 
+    private fun openWallpaperPreview() {
+        val service = ComponentName(this, VulkanWallpaperService::class.java)
+        val previewIntent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
+            putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, service)
+        }
+
+        statusLabel.text = "Opening Android wallpaper preview..."
+        EventRecorder.record("INFO", "APP", "Opening Android live wallpaper preview")
+
+        runCatching {
+            startActivity(previewIntent)
+        }.onFailure {
+            statusLabel.text = "Could not open wallpaper preview"
+            EventRecorder.record(
+                "ERROR",
+                "APP",
+                "Could not open Android wallpaper preview: ${{it.message}"
+            )
+            Toast.makeText(
+                this,
+                "Could not open wallpaper preview",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     private fun logVulkanFeatures() {
         val features = packageManager.systemAvailableFeatures
             .filter { it.name?.contains("vulkan", ignoreCase = true) == true }
-            .joinToString { "${it.name} (version=${it.version})" }
+            .joinToString { "${{it.name} (version=${{it.version})" }
 
         if (features.isBlank()) {
             EventRecorder.record(
@@ -202,46 +200,17 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        EventRecorder.record("INFO", "SURFACE", "Surface created")
-        if (!nativeLibraryLoaded) return
-
-        runCatching {
-            nativeStart(holder.surface, assets)
-        }.onFailure {
-            EventRecorder.record("ERROR", "APP", "Could not start Vulkan renderer: ${it.message}")
-        }
-    }
-
-    override fun surfaceChanged(
-        holder: SurfaceHolder,
-        format: Int,
-        width: Int,
-        height: Int
-    ) {
-        EventRecorder.record("INFO", "SURFACE", "Surface size changed to ${width}x${height}")
-        if (nativeLibraryLoaded) nativeResize(width, height)
-    }
-
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        EventRecorder.record("INFO", "SURFACE", "Surface destroyed")
-        if (nativeLibraryLoaded) nativeStop()
-    }
-
     override fun onPause() {
-        if (nativeLibraryLoaded) nativeSetPaused(true)
         EventRecorder.record("INFO", "LIFECYCLE", "Activity paused")
         super.onPause()
     }
 
     override fun onResume() {
         super.onResume()
-        if (nativeLibraryLoaded) nativeSetPaused(false)
         EventRecorder.record("INFO", "LIFECYCLE", "Activity resumed")
     }
 
     override fun onDestroy() {
-        if (nativeLibraryLoaded) nativeStop()
         EventRecorder.setListener(null)
         if (activeActivity?.get() === this) activeActivity = null
         super.onDestroy()
@@ -249,11 +218,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun dp(value: Int): Int =
         (value * resources.displayMetrics.density).toInt()
-
-    private external fun nativeStart(surface: Surface, assetManager: AssetManager)
-    private external fun nativeResize(width: Int, height: Int)
-    private external fun nativeSetPaused(paused: Boolean)
-    private external fun nativeStop()
 
     companion object {
         private var activeActivity: WeakReference<MainActivity>? = null
@@ -268,15 +232,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
                 activity.statusLabel.text = when {
                     level.equals("ERROR", ignoreCase = true) ->
-                        "Renderer status: error — $message"
+                        "Wallpaper status: error — $message"
                     message.startsWith("READY:") ->
-                        "Renderer status: running — ${message.removePrefix("READY:").trim()}"
-                    message.contains("paused", ignoreCase = true) ->
-                        "Renderer status: paused"
-                    message.contains("resumed", ignoreCase = true) ->
-                        "Renderer status: running"
+                        "Wallpaper status: rendering — ${{message.removePrefix("READY:").trim()}"
+                    message.contains("Renderer paused", ignoreCase = true) ->
+                        "Wallpaper status: paused"
+                    message.contains("Renderer resumed", ignoreCase = true) ->
+                        "Wallpaper status: rendering"
                     message.startsWith("Renderer stopped") ->
-                        "Renderer status: stopped"
+                        "Wallpaper status: stopped"
                     else -> activity.statusLabel.text
                 }
             }
