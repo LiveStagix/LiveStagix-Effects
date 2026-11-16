@@ -284,6 +284,7 @@ private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties deviceProperties_{};
     VkDevice device_ = VK_NULL_HANDLE;
+    VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
     VkQueue graphicsQueue_ = VK_NULL_HANDLE;
     VkQueue presentQueue_ = VK_NULL_HANDLE;
     QueueFamilies queueFamilies_{};
@@ -411,6 +412,7 @@ private:
 
         emitLog("INFO", "Creating logical device and queues");
         createLogicalDevice();
+        createPipelineCache();
 
         createCommandPool();
         createFrameSync();
@@ -676,6 +678,33 @@ private:
         vkGetDeviceQueue(device_, queueFamilies_.present, 0, &presentQueue_);
 
         emitLog("INFO", "Logical device created; graphics and presentation queues acquired");
+    }
+
+    void createPipelineCache() {
+        VkPipelineCacheCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+
+        const VkResult result = vkCreatePipelineCache(
+            device_,
+            &createInfo,
+            nullptr,
+            &pipelineCache_
+        );
+        if (result != VK_SUCCESS) {
+            pipelineCache_ = VK_NULL_HANDLE;
+            emitLog(
+                "WARN",
+                "Vulkan pipeline cache unavailable (VkResult=" +
+                    std::to_string(static_cast<int>(result)) +
+                    "); continuing without it"
+            );
+            return;
+        }
+
+        emitLog(
+            "INFO",
+            "Vulkan pipeline cache created for reuse during this logical-device lifetime"
+        );
     }
 
     void createCommandPool() {
@@ -1159,7 +1188,7 @@ private:
             requireVk(
                 vkCreateGraphicsPipelines(
                     device_,
-                    VK_NULL_HANDLE,
+                    pipelineCache_,
                     1,
                     &pipelineInfo,
                     nullptr,
@@ -1738,6 +1767,11 @@ private:
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
             cleanupSwapchain();
+
+            if (pipelineCache_ != VK_NULL_HANDLE) {
+                vkDestroyPipelineCache(device_, pipelineCache_, nullptr);
+                pipelineCache_ = VK_NULL_HANDLE;
+            }
 
             if (timestampQueryPool_ != VK_NULL_HANDLE) {
                 vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
