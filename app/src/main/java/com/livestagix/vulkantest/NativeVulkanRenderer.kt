@@ -22,7 +22,7 @@ object NativeVulkanRenderer {
             EventRecorder.record(
                 "ERROR",
                 "VULKAN",
-                "Could not load native renderer library: ${{it.message}"
+                "Could not load native renderer library: ${it.message}"
             )
             false
         }

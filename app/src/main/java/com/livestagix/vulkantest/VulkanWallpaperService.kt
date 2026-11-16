@@ -51,7 +51,7 @@ class VulkanWallpaperService : WallpaperService() {
                 EventRecorder.record(
                     "ERROR",
                     "WALLPAPER",
-                    "Could not start Vulkan wallpaper renderer: ${{it.message}"
+                    "Could not start Vulkan wallpaper renderer: ${it.message}"
                 )
             }
         }
@@ -66,7 +66,7 @@ class VulkanWallpaperService : WallpaperService() {
             EventRecorder.record(
                 "INFO",
                 "SURFACE",
-                "Wallpaper surface size changed to ${{width}x${{height}"
+                "Wallpaper surface size changed to ${width}x${height}"
             )
 
             if (rendererStarted) {
@@ -76,7 +76,7 @@ class VulkanWallpaperService : WallpaperService() {
                     EventRecorder.record(
                         "ERROR",
                         "SURFACE",
-                        "Could not resize Vulkan wallpaper surface: ${{it.message}"
+                        "Could not resize Vulkan wallpaper surface: ${it.message}"
                     )
                 }
             }
@@ -93,7 +93,7 @@ class VulkanWallpaperService : WallpaperService() {
                     EventRecorder.record(
                         "ERROR",
                         "WALLPAPER",
-                        "Could not update Vulkan renderer visibility: ${{it.message}"
+                        "Could not update Vulkan renderer visibility: ${it.message}"
                     )
                 }
             }
@@ -120,7 +120,7 @@ class VulkanWallpaperService : WallpaperService() {
                 EventRecorder.record(
                     "ERROR",
                     "WALLPAPER",
-                    "Could not stop Vulkan wallpaper renderer: ${{it.message}"
+                    "Could not stop Vulkan wallpaper renderer: ${it.message}"
                 )
             }
             rendererStarted = false

@@ -35,8 +35,8 @@ class MainActivity : Activity() {
         EventRecorder.record(
             "INFO",
             "DEVICE",
-            "Device=${{Build.MANUFACTURER} ${{Build.MODEL}; Android API=${{Build.VERSION.SDK_INT}; " +
-                "hardware=${{Build.HARDWARE}; ABI=${{Build.SUPPORTED_ABIS.joinToString()}"
+            "Device=${Build.MANUFACTURER} ${Build.MODEL}; Android API=${Build.VERSION.SDK_INT}; " +
+                "hardware=${Build.HARDWARE}; ABI=${Build.SUPPORTED_ABIS.joinToString()}"
         )
         logVulkanFeatures()
 
@@ -160,7 +160,7 @@ class MainActivity : Activity() {
             EventRecorder.record(
                 "ERROR",
                 "APP",
-                "Could not open Android wallpaper preview: ${{it.message}"
+                "Could not open Android wallpaper preview: ${it.message}"
             )
             Toast.makeText(
                 this,
@@ -173,7 +173,7 @@ class MainActivity : Activity() {
     private fun logVulkanFeatures() {
         val features = packageManager.systemAvailableFeatures
             .filter { it.name?.contains("vulkan", ignoreCase = true) == true }
-            .joinToString { "${{it.name} (version=${{it.version})" }
+            .joinToString { "${it.name} (version=${it.version})" }
 
         if (features.isBlank()) {
             EventRecorder.record(
@@ -234,7 +234,7 @@ class MainActivity : Activity() {
                     level.equals("ERROR", ignoreCase = true) ->
                         "Wallpaper status: error — $message"
                     message.startsWith("READY:") ->
-                        "Wallpaper status: rendering — ${{message.removePrefix("READY:").trim()}"
+                        "Wallpaper status: rendering — ${message.removePrefix("READY:").trim()}"
                     message.contains("Renderer paused", ignoreCase = true) ->
                         "Wallpaper status: paused"
                     message.contains("Renderer resumed", ignoreCase = true) ->
