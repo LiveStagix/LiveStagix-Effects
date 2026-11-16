@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -1468,7 +1469,8 @@ private:
 };
 
 std::mutex gRendererMutex;
-std::unique_ptr<VulkanRenderer> gRenderer;
+std::unordered_map<jlong, std::unique_ptr<VulkanRenderer>> gRenderers;
+std::atomic<jlong> gNextRendererHandle{1};
 
 } // namespace
 
@@ -1503,7 +1505,7 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     return JNI_VERSION_1_6;
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C" JNIEXPORT jlong JNICALL
 Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeStart(
     JNIEnv* env,
     jobject,
@@ -1513,55 +1515,123 @@ Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeStart(
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     if (window == nullptr) {
         emitLog("ERROR", "ANativeWindow_fromSurface returned null");
-        return;
+        return 0;
     }
 
     AAssetManager* assets = AAssetManager_fromJava(env, assetManager);
     if (assets == nullptr) {
         ANativeWindow_release(window);
         emitLog("ERROR", "AAssetManager_fromJava returned null");
-        return;
+        return 0;
     }
 
-    std::lock_guard<std::mutex> lock(gRendererMutex);
-    if (gRenderer != nullptr) {
-        gRenderer->stop();
-        gRenderer.reset();
+    const jlong handle = gNextRendererHandle.fetch_add(1, std::memory_order_relaxed);
+    std::unique_ptr<VulkanRenderer> renderer;
+
+    try {
+        renderer = std::make_unique<VulkanRenderer>(window, assets);
+        window = nullptr; // Ownership moves to VulkanRenderer.
+        renderer->start();
+
+        {
+            std::lock_guard<std::mutex> lock(gRendererMutex);
+            const auto inserted = gRenderers.emplace(handle, std::move(renderer));
+            if (!inserted.second) {
+                throw std::runtime_error("Duplicate Vulkan renderer handle");
+            }
+        }
+
+        emitLog("INFO", "Vulkan renderer started for engine handle " + std::to_string(handle));
+        return handle;
+    } catch (const std::exception& error) {
+        if (window != nullptr) ANativeWindow_release(window);
+        emitLog(
+            "ERROR",
+            "Could not start Vulkan renderer handle " + std::to_string(handle) +
+                ": " + error.what()
+        );
+    } catch (...) {
+        if (window != nullptr) ANativeWindow_release(window);
+        emitLog(
+            "ERROR",
+            "Could not start Vulkan renderer handle " + std::to_string(handle) +
+                ": unknown native error"
+        );
     }
 
-    gRenderer = std::make_unique<VulkanRenderer>(window, assets);
-    gRenderer->start();
+    return 0;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeResize(
     JNIEnv*,
     jobject,
+    jlong handle,
     jint width,
     jint height
 ) {
-    std::lock_guard<std::mutex> lock(gRendererMutex);
-    if (gRenderer != nullptr) gRenderer->requestResize(width, height);
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(gRendererMutex);
+        const auto renderer = gRenderers.find(handle);
+        if (renderer != gRenderers.end()) {
+            renderer->second->requestResize(width, height);
+            found = true;
+        }
+    }
+
+    if (!found) {
+        emitLog(
+            "WARN",
+            "Ignoring resize for unknown Vulkan renderer handle " + std::to_string(handle)
+        );
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeSetPaused(
     JNIEnv*,
     jobject,
+    jlong handle,
     jboolean paused
 ) {
-    std::lock_guard<std::mutex> lock(gRendererMutex);
-    if (gRenderer != nullptr) gRenderer->setPaused(paused == JNI_TRUE);
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(gRendererMutex);
+        const auto renderer = gRenderers.find(handle);
+        if (renderer != gRenderers.end()) {
+            renderer->second->setPaused(paused == JNI_TRUE);
+            found = true;
+        }
+    }
+
+    if (!found) {
+        emitLog(
+            "WARN",
+            "Ignoring visibility update for unknown Vulkan renderer handle " +
+                std::to_string(handle)
+        );
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_livestagix_vulkantest_NativeVulkanRenderer_nativeStop(
     JNIEnv*,
-    jobject
+    jobject,
+    jlong handle
 ) {
-    std::lock_guard<std::mutex> lock(gRendererMutex);
-    if (gRenderer != nullptr) {
-        gRenderer->stop();
-        gRenderer.reset();
+    std::unique_ptr<VulkanRenderer> renderer;
+    {
+        std::lock_guard<std::mutex> lock(gRendererMutex);
+        const auto entry = gRenderers.find(handle);
+        if (entry == gRenderers.end()) {
+            return;
+        }
+        renderer = std::move(entry->second);
+        gRenderers.erase(entry);
     }
+
+    // Stop outside the registry lock because joining the render thread can take time.
+    renderer->stop();
+    emitLog("INFO", "Vulkan renderer stopped for engine handle " + std::to_string(handle));
 }
