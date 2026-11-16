@@ -4,7 +4,7 @@ import android.content.res.AssetManager
 import android.view.Surface
 
 /**
- * Shared JNI entry point for the single Vulkan renderer used by the wallpaper engine.
+ * JNI entry point for independent Vulkan renderer instances owned by wallpaper engines.
  */
 object NativeVulkanRenderer {
     @Volatile
@@ -28,8 +28,8 @@ object NativeVulkanRenderer {
         }
     }
 
-    external fun nativeStart(surface: Surface, assetManager: AssetManager)
-    external fun nativeResize(width: Int, height: Int)
-    external fun nativeSetPaused(paused: Boolean)
-    external fun nativeStop()
+    external fun nativeStart(surface: Surface, assetManager: AssetManager): Long
+    external fun nativeResize(rendererHandle: Long, width: Int, height: Int)
+    external fun nativeSetPaused(rendererHandle: Long, paused: Boolean)
+    external fun nativeStop(rendererHandle: Long)
 }
