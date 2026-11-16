@@ -13,7 +13,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <time.h>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -164,6 +166,7 @@ bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
 struct QueueFamilies {
     uint32_t graphics = UINT32_MAX;
     uint32_t present = UINT32_MAX;
+    uint32_t graphicsTimestampValidBits = 0;
 
     bool complete() const {
         return graphics != UINT32_MAX && present != UINT32_MAX;
@@ -291,6 +294,78 @@ private:
     VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
     std::vector<VkSemaphore> renderFinished_;
     VkFence inFlightFence_ = VK_NULL_HANDLE;
+    VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
+
+    uint32_t timestampValidBits_ = 0;
+    double timestampPeriodNs_ = 0.0;
+    bool timestampQueriesSupported_ = false;
+    bool timestampResultPending_ = false;
+
+    static uint64_t processCpuTimeNs() {
+        timespec cpuTime{};
+        if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpuTime) != 0) {
+            return 0;
+        }
+
+        return static_cast<uint64_t>(cpuTime.tv_sec) * 1'000'000'000ULL +
+            static_cast<uint64_t>(cpuTime.tv_nsec);
+    }
+
+    bool readKgslGpuBusyPercent(double& percent) const {
+        std::ifstream counter("/sys/class/kgsl/kgsl-3d0/gpubusy");
+        uint64_t busyTicks = 0;
+        uint64_t totalTicks = 0;
+
+        if (!(counter >> busyTicks >> totalTicks) || totalTicks == 0) {
+            return false;
+        }
+
+        percent = std::min(
+            100.0,
+            static_cast<double>(busyTicks) * 100.0 /
+                static_cast<double>(totalTicks)
+        );
+        return true;
+    }
+
+    bool collectGpuTimestamp(double& gpuFrameMs) {
+        if (!timestampQueriesSupported_ ||
+            !timestampResultPending_ ||
+            timestampQueryPool_ == VK_NULL_HANDLE) {
+            return false;
+        }
+
+        uint64_t timestamps[2] = {0, 0};
+        const VkResult result = vkGetQueryPoolResults(
+            device_,
+            timestampQueryPool_,
+            0,
+            2,
+            sizeof(timestamps),
+            timestamps,
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT
+        );
+
+        timestampResultPending_ = false;
+        if (result != VK_SUCCESS) {
+            emitLog(
+                "WARN",
+                "GPU timestamp result unavailable: " + vkResultString(result)
+            );
+            return false;
+        }
+
+        uint64_t elapsedTicks = timestamps[1] - timestamps[0];
+        if (timestampValidBits_ < 64) {
+            const uint64_t mask = (1ULL << timestampValidBits_) - 1ULL;
+            elapsedTicks = (timestamps[1] - timestamps[0]) & mask;
+        }
+
+        gpuFrameMs =
+            static_cast<double>(elapsedTicks) * timestampPeriodNs_ / 1'000'000.0;
+        return true;
+    }
 
     void threadMain() {
         emitLog("INFO", "Native Vulkan render thread started");
@@ -330,6 +405,26 @@ private:
 
         createCommandPool();
         createFrameSync();
+        createTimestampQueries();
+
+        double initialGpuBusyPercent = 0.0;
+        if (readKgslGpuBusyPercent(initialGpuBusyPercent)) {
+            emitLog(
+                "INFO",
+                "KGSL GPU busy counter is readable; it reports system-wide activity from the latest driver sample"
+            );
+        } else {
+            emitLog(
+                "INFO",
+                "KGSL GPU busy counter is unavailable to this app; GPU busy percentage will be reported as unavailable"
+            );
+        }
+
+        emitLog(
+            "INFO",
+            "CPU metric uses wallpaper-process CPU time; values can exceed 100% when multiple cores are active"
+        );
+
         createSwapchainResources();
 
         emitLog("INFO", "Initial Vulkan setup completed");
@@ -451,6 +546,8 @@ private:
                 if ((families[index].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 &&
                     candidateFamilies.graphics == UINT32_MAX) {
                     candidateFamilies.graphics = index;
+                    candidateFamilies.graphicsTimestampValidBits =
+                        families[index].timestampValidBits;
                 }
 
                 VkBool32 canPresent = VK_FALSE;
@@ -512,6 +609,26 @@ private:
             "INFO",
             "Selected GPU Vulkan API: " + vkVersionString(deviceProperties_.apiVersion)
         );
+
+        timestampValidBits_ = queueFamilies_.graphicsTimestampValidBits;
+        timestampPeriodNs_ =
+            static_cast<double>(deviceProperties_.limits.timestampPeriod);
+        timestampQueriesSupported_ =
+            timestampValidBits_ > 0 && timestampPeriodNs_ > 0.0;
+
+        if (timestampQueriesSupported_) {
+            emitLog(
+                "INFO",
+                "GPU timestamp queries supported; timestampPeriodNs=" +
+                    std::to_string(timestampPeriodNs_) +
+                    " | validBits=" + std::to_string(timestampValidBits_)
+            );
+        } else {
+            emitLog(
+                "WARN",
+                "GPU timestamp queries are not supported on the selected graphics queue"
+            );
+        }
     }
 
     void createLogicalDevice() {
@@ -580,6 +697,34 @@ private:
             vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_),
             "vkCreateFence"
         );
+    }
+
+    void createTimestampQueries() {
+        if (!timestampQueriesSupported_) return;
+
+        VkQueryPoolCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        createInfo.queryCount = 2;
+
+        const VkResult result = vkCreateQueryPool(
+            device_,
+            &createInfo,
+            nullptr,
+            &timestampQueryPool_
+        );
+
+        if (result != VK_SUCCESS) {
+            timestampQueriesSupported_ = false;
+            timestampQueryPool_ = VK_NULL_HANDLE;
+            emitLog(
+                "WARN",
+                "Could not create GPU timestamp query pool: " + vkResultString(result)
+            );
+            return;
+        }
+
+        emitLog("INFO", "GPU timestamp query pool created");
     }
 
     VkSurfaceFormatKHR chooseSurfaceFormat(
@@ -883,8 +1028,8 @@ private:
     }
 
     void createGraphicsPipeline() {
-        const std::vector<uint32_t> vertexCode = loadShader("shaders/triangle.vert.spv");
-        const std::vector<uint32_t> fragmentCode = loadShader("shaders/triangle.frag.spv");
+        const std::vector<uint32_t> vertexCode = loadShader("shaders/vortex.vert.spv");
+        const std::vector<uint32_t> fragmentCode = loadShader("shaders/vortex.frag.spv");
 
         VkShaderModule vertexModule = createShaderModule(vertexCode);
         VkShaderModule fragmentModule = VK_NULL_HANDLE;
@@ -960,8 +1105,15 @@ private:
             dynamicState.dynamicStateCount = 2;
             dynamicState.pDynamicStates = dynamicStates;
 
+            VkPushConstantRange frameDataRange{};
+            frameDataRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            frameDataRange.offset = 0;
+            frameDataRange.size = sizeof(float) * 4;
+
             VkPipelineLayoutCreateInfo layoutInfo{};
             layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &frameDataRange;
             requireVk(
                 vkCreatePipelineLayout(
                     device_, &layoutInfo, nullptr, &pipelineLayout_
@@ -1005,7 +1157,7 @@ private:
 
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
         vkDestroyShaderModule(device_, vertexModule, nullptr);
-        emitLog("INFO", "Graphics pipeline created from precompiled SPIR-V shaders");
+        emitLog("INFO", "Aurora Vortex graphics pipeline created from precompiled SPIR-V shaders");
     }
 
     void createFramebuffers() {
@@ -1062,7 +1214,7 @@ private:
         }
     }
 
-    void recordCommandBuffer(uint32_t imageIndex) {
+    void recordCommandBuffer(uint32_t imageIndex, float animationTimeSeconds) {
         VkCommandBuffer commandBuffer = commandBuffers_[imageIndex];
 
         VkCommandBufferBeginInfo beginInfo{};
@@ -1089,11 +1241,36 @@ private:
         renderBegin.clearValueCount = 1;
         renderBegin.pClearValues = &clearColor;
 
+        if (timestampQueriesSupported_) {
+            vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, 0, 2);
+            vkCmdWriteTimestamp(
+                commandBuffer,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                timestampQueryPool_,
+                0
+            );
+        }
+
         vkCmdBeginRenderPass(commandBuffer, &renderBegin, VK_SUBPASS_CONTENTS_INLINE);
         vkCmdBindPipeline(
             commandBuffer,
             VK_PIPELINE_BIND_POINT_GRAPHICS,
             graphicsPipeline_
+        );
+
+        const float frameData[4] = {
+            static_cast<float>(swapchainExtent_.width),
+            static_cast<float>(swapchainExtent_.height),
+            animationTimeSeconds,
+            0.0f
+        };
+        vkCmdPushConstants(
+            commandBuffer,
+            pipelineLayout_,
+            VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(frameData),
+            frameData
         );
 
         VkViewport viewport{};
@@ -1112,6 +1289,15 @@ private:
 
         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
         vkCmdEndRenderPass(commandBuffer);
+
+        if (timestampQueriesSupported_) {
+            vkCmdWriteTimestamp(
+                commandBuffer,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                timestampQueryPool_,
+                1
+            );
+        }
 
         requireVk(
             vkEndCommandBuffer(commandBuffer),
@@ -1169,9 +1355,14 @@ private:
 
     void renderLoop() {
         using Clock = std::chrono::steady_clock;
+        const auto animationStart = Clock::now();
         auto sampleStart = Clock::now();
         uint64_t sampleFrames = 0;
-        double sampleFrameMs = 0.0;
+        double sampleFrameWallMs = 0.0;
+        double sampleGpuFrameMs = 0.0;
+        double sampleGpuMaxMs = 0.0;
+        uint64_t sampleGpuFrames = 0;
+        uint64_t sampleProcessCpuStartNs = processCpuTimeNs();
         bool wasPaused = false;
         bool swapchainOutOfDate = false;
         bool acquireSuboptimalLogged = false;
@@ -1192,7 +1383,11 @@ private:
             if (wasPaused) {
                 sampleStart = Clock::now();
                 sampleFrames = 0;
-                sampleFrameMs = 0.0;
+                sampleFrameWallMs = 0.0;
+                sampleGpuFrameMs = 0.0;
+                sampleGpuMaxMs = 0.0;
+                sampleGpuFrames = 0;
+                sampleProcessCpuStartNs = processCpuTimeNs();
 
                 emitLog("INFO", "Renderer resumed");
                 wasPaused = false;
@@ -1261,6 +1456,13 @@ private:
                 "vkWaitForFences"
             );
 
+            double completedGpuFrameMs = 0.0;
+            if (collectGpuTimestamp(completedGpuFrameMs)) {
+                sampleGpuFrameMs += completedGpuFrameMs;
+                sampleGpuMaxMs = std::max(sampleGpuMaxMs, completedGpuFrameMs);
+                ++sampleGpuFrames;
+            }
+
             uint32_t imageIndex = 0;
             const VkResult acquireResult = vkAcquireNextImageKHR(
                 device_,
@@ -1301,7 +1503,9 @@ private:
                 vkResetCommandBuffer(commandBuffers_[imageIndex], 0),
                 "vkResetCommandBuffer"
             );
-            recordCommandBuffer(imageIndex);
+            const float animationTimeSeconds =
+                std::chrono::duration<float>(Clock::now() - animationStart).count();
+            recordCommandBuffer(imageIndex, animationTimeSeconds);
 
             const VkPipelineStageFlags waitStage =
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1320,6 +1524,7 @@ private:
                 vkQueueSubmit(graphicsQueue_, 1, &submitInfo, inFlightFence_),
                 "vkQueueSubmit"
             );
+            timestampResultPending_ = timestampQueriesSupported_;
 
             VkPresentInfoKHR presentInfo{};
             presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1355,7 +1560,7 @@ private:
             const auto frameEnd = Clock::now();
             const double frameMs =
                 std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
-            sampleFrameMs += frameMs;
+            sampleFrameWallMs += frameMs;
             ++sampleFrames;
 
             const double elapsedSeconds =
@@ -1363,20 +1568,65 @@ private:
 
             if (elapsedSeconds >= 5.0) {
                 const double fps = static_cast<double>(sampleFrames) / elapsedSeconds;
-                const double averageMs =
-                    sampleFrames > 0 ? sampleFrameMs / static_cast<double>(sampleFrames) : 0.0;
+                const double averageFrameWallMs =
+                    sampleFrames > 0
+                        ? sampleFrameWallMs / static_cast<double>(sampleFrames)
+                        : 0.0;
+
+                const uint64_t processCpuNowNs = processCpuTimeNs();
+                const double processCpuPercent =
+                    sampleProcessCpuStartNs > 0 &&
+                    processCpuNowNs >= sampleProcessCpuStartNs
+                        ? static_cast<double>(processCpuNowNs - sampleProcessCpuStartNs) /
+                            (elapsedSeconds * 1'000'000'000.0) * 100.0
+                        : -1.0;
+
+                double kgslBusyPercent = 0.0;
+                const bool hasKgslBusyPercent =
+                    readKgslGpuBusyPercent(kgslBusyPercent);
 
                 std::ostringstream metrics;
                 metrics.setf(std::ios::fixed);
                 metrics.precision(1);
                 metrics << "PERF: fps=" << fps
-                        << " | avgCpuFrameMs=" << averageMs
-                        << " | frames=" << sampleFrames;
+                        << " | avgFrameWallMs=" << averageFrameWallMs
+                        << " | processCpuPct=";
+                if (processCpuPercent >= 0.0) {
+                    metrics << processCpuPercent;
+                } else {
+                    metrics << "unavailable";
+                }
+
+                metrics << " | gpuAvgMs=";
+                if (sampleGpuFrames > 0) {
+                    metrics << (sampleGpuFrameMs /
+                        static_cast<double>(sampleGpuFrames));
+                    metrics << " | gpuMaxMs=" << sampleGpuMaxMs;
+                } else if (timestampQueriesSupported_) {
+                    metrics << "unavailable";
+                    metrics << " | gpuMaxMs=unavailable";
+                } else {
+                    metrics << "unsupported";
+                    metrics << " | gpuMaxMs=unsupported";
+                }
+
+                metrics << " | gpuFrames=" << sampleGpuFrames
+                        << " | kgslBusyPctLastWindow=";
+                if (hasKgslBusyPercent) {
+                    metrics << kgslBusyPercent;
+                } else {
+                    metrics << "unavailable";
+                }
+                metrics << " | frames=" << sampleFrames;
                 emitLog("INFO", metrics.str());
 
                 sampleStart = frameEnd;
                 sampleFrames = 0;
-                sampleFrameMs = 0.0;
+                sampleFrameWallMs = 0.0;
+                sampleGpuFrameMs = 0.0;
+                sampleGpuMaxMs = 0.0;
+                sampleGpuFrames = 0;
+                sampleProcessCpuStartNs = processCpuNowNs;
             }
         }
     }
@@ -1439,6 +1689,11 @@ private:
         if (device_ != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device_);
             cleanupSwapchain();
+
+            if (timestampQueryPool_ != VK_NULL_HANDLE) {
+                vkDestroyQueryPool(device_, timestampQueryPool_, nullptr);
+                timestampQueryPool_ = VK_NULL_HANDLE;
+            }
 
             if (imageAvailable_ != VK_NULL_HANDLE) {
                 vkDestroySemaphore(device_, imageAvailable_, nullptr);
