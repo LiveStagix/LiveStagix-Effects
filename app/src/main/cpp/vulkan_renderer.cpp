@@ -9,6 +9,7 @@
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -28,6 +29,7 @@
 namespace {
 
 constexpr const char* kLogTag = "LiveStagixVulkan";
+constexpr uint32_t kMaxFramesInFlight = 2;
 JavaVM* gJavaVm = nullptr;
 jclass gActivityClass = nullptr;
 jmethodID gNativeLogMethod = nullptr;
@@ -173,6 +175,13 @@ struct QueueFamilies {
     }
 };
 
+struct FrameResources {
+    VkSemaphore imageAvailable = VK_NULL_HANDLE;
+    VkFence inFlightFence = VK_NULL_HANDLE;
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    bool timestampPending = false;
+};
+
 class VulkanRenderer {
 public:
     VulkanRenderer(ANativeWindow* window, AAssetManager* assets)
@@ -290,16 +299,14 @@ private:
     std::vector<VkFramebuffer> framebuffers_;
 
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
-    std::vector<VkCommandBuffer> commandBuffers_;
-    VkSemaphore imageAvailable_ = VK_NULL_HANDLE;
+    std::array<FrameResources, kMaxFramesInFlight> frames_{};
+    std::vector<VkFence> imagesInFlight_;
     std::vector<VkSemaphore> renderFinished_;
-    VkFence inFlightFence_ = VK_NULL_HANDLE;
     VkQueryPool timestampQueryPool_ = VK_NULL_HANDLE;
 
     uint32_t timestampValidBits_ = 0;
     double timestampPeriodNs_ = 0.0;
     bool timestampQueriesSupported_ = false;
-    bool timestampResultPending_ = false;
 
     static uint64_t processCpuTimeNs() {
         timespec cpuTime{};
@@ -328,18 +335,20 @@ private:
         return true;
     }
 
-    bool collectGpuTimestamp(double& gpuFrameMs) {
+    bool collectGpuTimestamp(uint32_t frameIndex, double& gpuFrameMs) {
         if (!timestampQueriesSupported_ ||
-            !timestampResultPending_ ||
+            frameIndex >= frames_.size() ||
+            !frames_[frameIndex].timestampPending ||
             timestampQueryPool_ == VK_NULL_HANDLE) {
             return false;
         }
 
+        const uint32_t firstQuery = frameIndex * 2;
         uint64_t timestamps[2] = {0, 0};
         const VkResult result = vkGetQueryPoolResults(
             device_,
             timestampQueryPool_,
-            0,
+            firstQuery,
             2,
             sizeof(timestamps),
             timestamps,
@@ -347,7 +356,7 @@ private:
             VK_QUERY_RESULT_64_BIT
         );
 
-        timestampResultPending_ = false;
+        frames_[frameIndex].timestampPending = false;
         if (result != VK_SUCCESS) {
             emitLog(
                 "WARN",
@@ -685,18 +694,28 @@ private:
     void createFrameSync() {
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        requireVk(
-            vkCreateSemaphore(device_, &semaphoreInfo, nullptr, &imageAvailable_),
-            "vkCreateSemaphore(imageAvailable)"
-        );
 
         VkFenceCreateInfo fenceInfo{};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-        requireVk(
-            vkCreateFence(device_, &fenceInfo, nullptr, &inFlightFence_),
-            "vkCreateFence"
-        );
+
+        for (uint32_t index = 0; index < kMaxFramesInFlight; ++index) {
+            FrameResources& frame = frames_[index];
+
+            requireVk(
+                vkCreateSemaphore(
+                    device_, &semaphoreInfo, nullptr, &frame.imageAvailable
+                ),
+                "vkCreateSemaphore(imageAvailable)"
+            );
+            requireVk(
+                vkCreateFence(
+                    device_, &fenceInfo, nullptr, &frame.inFlightFence
+                ),
+                "vkCreateFence(inFlight)"
+            );
+        }
+        emitLog("INFO", "Created two independent frames-in-flight synchronization slots");
     }
 
     void createTimestampQueries() {
@@ -705,7 +724,7 @@ private:
         VkQueryPoolCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        createInfo.queryCount = 2;
+        createInfo.queryCount = kMaxFramesInFlight * 2;
 
         const VkResult result = vkCreateQueryPool(
             device_,
@@ -895,6 +914,7 @@ private:
             ),
             "vkGetSwapchainImagesKHR(list)"
         );
+        imagesInFlight_.assign(actualImageCount, VK_NULL_HANDLE);
 
         emitLog(
             "INFO",
@@ -1186,21 +1206,26 @@ private:
     }
 
     void createCommandBuffers() {
-        commandBuffers_.resize(framebuffers_.size());
+        std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
 
         VkCommandBufferAllocateInfo allocateInfo{};
         allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocateInfo.commandPool = commandPool_;
         allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocateInfo.commandBufferCount = static_cast<uint32_t>(commandBuffers_.size());
+        allocateInfo.commandBufferCount = kMaxFramesInFlight;
 
         requireVk(
-            vkAllocateCommandBuffers(device_, &allocateInfo, commandBuffers_.data()),
+            vkAllocateCommandBuffers(device_, &allocateInfo, commandBuffers.data()),
             "vkAllocateCommandBuffers"
         );
+
+        for (uint32_t index = 0; index < kMaxFramesInFlight; ++index) {
+            frames_[index].commandBuffer = commandBuffers[index];
+        }
     }
 
     void createRenderFinishedSemaphores() {
+        // Presentation wait semaphores are indexed by swapchain image, not frame slot.
         renderFinished_.resize(swapchainImages_.size());
 
         VkSemaphoreCreateInfo createInfo{};
@@ -1214,8 +1239,12 @@ private:
         }
     }
 
-    void recordCommandBuffer(uint32_t imageIndex, float animationTimeSeconds) {
-        VkCommandBuffer commandBuffer = commandBuffers_[imageIndex];
+    void recordCommandBuffer(
+        uint32_t frameIndex,
+        uint32_t imageIndex,
+        float animationTimeSeconds
+    ) {
+        VkCommandBuffer commandBuffer = frames_[frameIndex].commandBuffer;
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1242,12 +1271,12 @@ private:
         renderBegin.pClearValues = &clearColor;
 
         if (timestampQueriesSupported_) {
-            vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, 0, 2);
+            vkCmdResetQueryPool(commandBuffer, timestampQueryPool_, frameIndex * 2, 2);
             vkCmdWriteTimestamp(
                 commandBuffer,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                 timestampQueryPool_,
-                0
+                frameIndex * 2
             );
         }
 
@@ -1295,7 +1324,7 @@ private:
                 commandBuffer,
                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                 timestampQueryPool_,
-                1
+                frameIndex * 2 + 1
             );
         }
 
@@ -1368,11 +1397,15 @@ private:
         bool acquireSuboptimalLogged = false;
         bool presentSuboptimalLogged = false;
         auto lastForcedRecreation = Clock::time_point::min();
+        uint32_t frameIndex = 0;
 
         while (!stopRequested_.load()) {
             if (paused_.load()) {
                 if (!wasPaused) {
                     requireVk(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle(pause)");
+                    for (FrameResources& frame : frames_) {
+                        frame.timestampPending = false;
+                    }
                     emitLog("INFO", "Renderer paused; GPU work drained");
                     wasPaused = true;
                 }
@@ -1451,13 +1484,14 @@ private:
 
             const auto frameStart = Clock::now();
 
+            FrameResources& frame = frames_[frameIndex];
             requireVk(
-                vkWaitForFences(device_, 1, &inFlightFence_, VK_TRUE, UINT64_MAX),
-                "vkWaitForFences"
+                vkWaitForFences(device_, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX),
+                "vkWaitForFences(frame slot)"
             );
 
             double completedGpuFrameMs = 0.0;
-            if (collectGpuTimestamp(completedGpuFrameMs)) {
+            if (collectGpuTimestamp(frameIndex, completedGpuFrameMs)) {
                 sampleGpuFrameMs += completedGpuFrameMs;
                 sampleGpuMaxMs = std::max(sampleGpuMaxMs, completedGpuFrameMs);
                 ++sampleGpuFrames;
@@ -1468,7 +1502,7 @@ private:
                 device_,
                 swapchain_,
                 UINT64_MAX,
-                imageAvailable_,
+                frame.imageAvailable,
                 VK_NULL_HANDLE,
                 &imageIndex
             );
@@ -1495,17 +1529,20 @@ private:
                 requireVk(acquireResult, "vkAcquireNextImageKHR");
             }
 
+            if (imagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
+                requireVk(
+                    vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX),
+                    "vkWaitForFences(swapchain image)"
+                );
+            }
+
             requireVk(
-                vkResetFences(device_, 1, &inFlightFence_),
-                "vkResetFences"
-            );
-            requireVk(
-                vkResetCommandBuffer(commandBuffers_[imageIndex], 0),
-                "vkResetCommandBuffer"
+                vkResetCommandBuffer(frame.commandBuffer, 0),
+                "vkResetCommandBuffer(frame slot)"
             );
             const float animationTimeSeconds =
                 std::chrono::duration<float>(Clock::now() - animationStart).count();
-            recordCommandBuffer(imageIndex, animationTimeSeconds);
+            recordCommandBuffer(frameIndex, imageIndex, animationTimeSeconds);
 
             const VkPipelineStageFlags waitStage =
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1513,18 +1550,25 @@ private:
             VkSubmitInfo submitInfo{};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = &imageAvailable_;
+            submitInfo.pWaitSemaphores = &frame.imageAvailable;
             submitInfo.pWaitDstStageMask = &waitStage;
             submitInfo.commandBufferCount = 1;
-            submitInfo.pCommandBuffers = &commandBuffers_[imageIndex];
+            submitInfo.pCommandBuffers = &frame.commandBuffer;
             submitInfo.signalSemaphoreCount = 1;
             submitInfo.pSignalSemaphores = &renderFinished_[imageIndex];
 
             requireVk(
-                vkQueueSubmit(graphicsQueue_, 1, &submitInfo, inFlightFence_),
+                vkResetFences(device_, 1, &frame.inFlightFence),
+                "vkResetFences(frame slot)"
+            );
+            requireVk(
+                vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.inFlightFence),
                 "vkQueueSubmit"
             );
-            timestampResultPending_ = timestampQueriesSupported_;
+
+            imagesInFlight_[imageIndex] = frame.inFlightFence;
+            frame.timestampPending = timestampQueriesSupported_;
+            frameIndex = (frameIndex + 1) % kMaxFramesInFlight;
 
             VkPresentInfoKHR presentInfo{};
             presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1634,15 +1678,19 @@ private:
     void cleanupSwapchain() {
         if (device_ == VK_NULL_HANDLE) return;
 
-        if (!commandBuffers_.empty() && commandPool_ != VK_NULL_HANDLE) {
+        std::array<VkCommandBuffer, kMaxFramesInFlight> commandBuffers{};
+        uint32_t commandBufferCount = 0;
+        for (uint32_t index = 0; index < kMaxFramesInFlight; ++index) {
+            if (frames_[index].commandBuffer != VK_NULL_HANDLE) {
+                commandBuffers[commandBufferCount++] = frames_[index].commandBuffer;
+                frames_[index].commandBuffer = VK_NULL_HANDLE;
+            }
+        }
+        if (commandBufferCount > 0 && commandPool_ != VK_NULL_HANDLE) {
             vkFreeCommandBuffers(
-                device_,
-                commandPool_,
-                static_cast<uint32_t>(commandBuffers_.size()),
-                commandBuffers_.data()
+                device_, commandPool_, commandBufferCount, commandBuffers.data()
             );
         }
-        commandBuffers_.clear();
 
         for (VkFramebuffer framebuffer : framebuffers_) {
             if (framebuffer != VK_NULL_HANDLE) {
@@ -1678,6 +1726,7 @@ private:
             }
         }
         renderFinished_.clear();
+        imagesInFlight_.clear();
 
         if (swapchain_ != VK_NULL_HANDLE) {
             vkDestroySwapchainKHR(device_, swapchain_, nullptr);
@@ -1695,13 +1744,16 @@ private:
                 timestampQueryPool_ = VK_NULL_HANDLE;
             }
 
-            if (imageAvailable_ != VK_NULL_HANDLE) {
-                vkDestroySemaphore(device_, imageAvailable_, nullptr);
-                imageAvailable_ = VK_NULL_HANDLE;
-            }
-            if (inFlightFence_ != VK_NULL_HANDLE) {
-                vkDestroyFence(device_, inFlightFence_, nullptr);
-                inFlightFence_ = VK_NULL_HANDLE;
+            for (FrameResources& frame : frames_) {
+                if (frame.imageAvailable != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(device_, frame.imageAvailable, nullptr);
+                    frame.imageAvailable = VK_NULL_HANDLE;
+                }
+                if (frame.inFlightFence != VK_NULL_HANDLE) {
+                    vkDestroyFence(device_, frame.inFlightFence, nullptr);
+                    frame.inFlightFence = VK_NULL_HANDLE;
+                }
+                frame.timestampPending = false;
             }
             if (commandPool_ != VK_NULL_HANDLE) {
                 vkDestroyCommandPool(device_, commandPool_, nullptr);
