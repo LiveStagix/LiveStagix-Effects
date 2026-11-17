@@ -30,6 +30,52 @@ namespace {
 
 constexpr const char* kLogTag = "LiveStagixVulkan";
 constexpr uint32_t kMaxFramesInFlight = 2;
+
+struct TimingStats {
+    double totalMicroseconds = 0.0;
+    double maxMicroseconds = 0.0;
+    uint64_t calls = 0;
+
+    void add(double durationUs) {
+        totalMicroseconds += durationUs;
+        maxMicroseconds = std::max(maxMicroseconds, durationUs);
+        ++calls;
+    }
+
+    double averageMicroseconds() const {
+        return calls > 0
+            ? totalMicroseconds / static_cast<double>(calls)
+            : 0.0;
+    }
+
+    void reset() {
+        totalMicroseconds = 0.0;
+        maxMicroseconds = 0.0;
+        calls = 0;
+    }
+};
+
+void appendTimingStats(
+    std::ostringstream& metrics,
+    const char* name,
+    const TimingStats& stats
+) {
+    metrics << " | " << name << "AvgUs=";
+    if (stats.calls > 0) {
+        metrics << stats.averageMicroseconds();
+    } else {
+        metrics << "unavailable";
+    }
+
+    metrics << " | " << name << "MaxUs=";
+    if (stats.calls > 0) {
+        metrics << stats.maxMicroseconds;
+    } else {
+        metrics << "unavailable";
+    }
+    metrics << " | " << name << "Calls=" << stats.calls;
+}
+
 JavaVM* gJavaVm = nullptr;
 jclass gActivityClass = nullptr;
 jmethodID gNativeLogMethod = nullptr;
@@ -313,6 +359,16 @@ private:
     static uint64_t processCpuTimeNs() {
         timespec cpuTime{};
         if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpuTime) != 0) {
+            return 0;
+        }
+
+        return static_cast<uint64_t>(cpuTime.tv_sec) * 1'000'000'000ULL +
+            static_cast<uint64_t>(cpuTime.tv_nsec);
+    }
+
+    static uint64_t renderThreadCpuTimeNs() {
+        timespec cpuTime{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpuTime) != 0) {
             return 0;
         }
 
@@ -1439,6 +1495,15 @@ private:
         double sampleGpuMaxMs = 0.0;
         uint64_t sampleGpuFrames = 0;
         uint64_t sampleProcessCpuStartNs = processCpuTimeNs();
+        uint64_t sampleRenderThreadCpuStartNs = renderThreadCpuTimeNs();
+
+        TimingStats frameFenceWaitStats;
+        TimingStats imageFenceWaitStats;
+        TimingStats imageAcquireStats;
+        TimingStats commandRecordStats;
+        TimingStats queueSubmitStats;
+        TimingStats presentStats;
+
         bool wasPaused = false;
         bool swapchainOutOfDate = false;
         bool acquireSuboptimalLogged = false;
@@ -1468,6 +1533,14 @@ private:
                 sampleGpuMaxMs = 0.0;
                 sampleGpuFrames = 0;
                 sampleProcessCpuStartNs = processCpuTimeNs();
+                sampleRenderThreadCpuStartNs = renderThreadCpuTimeNs();
+
+                frameFenceWaitStats.reset();
+                imageFenceWaitStats.reset();
+                imageAcquireStats.reset();
+                commandRecordStats.reset();
+                queueSubmitStats.reset();
+                presentStats.reset();
 
                 emitLog("INFO", "Renderer resumed");
                 wasPaused = false;
@@ -1532,10 +1605,16 @@ private:
             const auto frameStart = Clock::now();
 
             FrameResources& frame = frames_[frameIndex];
-            requireVk(
-                vkWaitForFences(device_, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX),
-                "vkWaitForFences(frame slot)"
+            const auto frameFenceWaitStart = Clock::now();
+            const VkResult frameFenceWaitResult = vkWaitForFences(
+                device_, 1, &frame.inFlightFence, VK_TRUE, UINT64_MAX
             );
+            frameFenceWaitStats.add(
+                std::chrono::duration<double, std::micro>(
+                    Clock::now() - frameFenceWaitStart
+                ).count()
+            );
+            requireVk(frameFenceWaitResult, "vkWaitForFences(frame slot)");
 
             double completedGpuFrameMs = 0.0;
             if (collectGpuTimestamp(frameIndex, completedGpuFrameMs)) {
@@ -1545,6 +1624,7 @@ private:
             }
 
             uint32_t imageIndex = 0;
+            const auto imageAcquireStart = Clock::now();
             const VkResult acquireResult = vkAcquireNextImageKHR(
                 device_,
                 swapchain_,
@@ -1552,6 +1632,11 @@ private:
                 frame.imageAvailable,
                 VK_NULL_HANDLE,
                 &imageIndex
+            );
+            imageAcquireStats.add(
+                std::chrono::duration<double, std::micro>(
+                    Clock::now() - imageAcquireStart
+                ).count()
             );
 
             if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -1577,12 +1662,19 @@ private:
             }
 
             if (imagesInFlight_[imageIndex] != VK_NULL_HANDLE) {
-                requireVk(
-                    vkWaitForFences(device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX),
-                    "vkWaitForFences(swapchain image)"
+                const auto imageFenceWaitStart = Clock::now();
+                const VkResult imageFenceWaitResult = vkWaitForFences(
+                    device_, 1, &imagesInFlight_[imageIndex], VK_TRUE, UINT64_MAX
                 );
+                imageFenceWaitStats.add(
+                    std::chrono::duration<double, std::micro>(
+                        Clock::now() - imageFenceWaitStart
+                    ).count()
+                );
+                requireVk(imageFenceWaitResult, "vkWaitForFences(swapchain image)");
             }
 
+            const auto commandRecordStart = Clock::now();
             requireVk(
                 vkResetCommandBuffer(frame.commandBuffer, 0),
                 "vkResetCommandBuffer(frame slot)"
@@ -1590,6 +1682,11 @@ private:
             const float animationTimeSeconds =
                 std::chrono::duration<float>(Clock::now() - animationStart).count();
             recordCommandBuffer(frameIndex, imageIndex, animationTimeSeconds);
+            commandRecordStats.add(
+                std::chrono::duration<double, std::micro>(
+                    Clock::now() - commandRecordStart
+                ).count()
+            );
 
             const VkPipelineStageFlags waitStage =
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1608,10 +1705,16 @@ private:
                 vkResetFences(device_, 1, &frame.inFlightFence),
                 "vkResetFences(frame slot)"
             );
-            requireVk(
-                vkQueueSubmit(graphicsQueue_, 1, &submitInfo, frame.inFlightFence),
-                "vkQueueSubmit"
+            const auto queueSubmitStart = Clock::now();
+            const VkResult queueSubmitResult = vkQueueSubmit(
+                graphicsQueue_, 1, &submitInfo, frame.inFlightFence
             );
+            queueSubmitStats.add(
+                std::chrono::duration<double, std::micro>(
+                    Clock::now() - queueSubmitStart
+                ).count()
+            );
+            requireVk(queueSubmitResult, "vkQueueSubmit");
 
             imagesInFlight_[imageIndex] = frame.inFlightFence;
             frame.timestampPending = timestampQueriesSupported_;
@@ -1625,7 +1728,13 @@ private:
             presentInfo.pSwapchains = &swapchain_;
             presentInfo.pImageIndices = &imageIndex;
 
+            const auto presentStart = Clock::now();
             const VkResult presentResult = vkQueuePresentKHR(presentQueue_, &presentInfo);
+            presentStats.add(
+                std::chrono::duration<double, std::micro>(
+                    Clock::now() - presentStart
+                ).count()
+            );
             if (presentResult == VK_ERROR_OUT_OF_DATE_KHR) {
                 emitLog(
                     "WARN",
@@ -1672,6 +1781,15 @@ private:
                             (elapsedSeconds * 1'000'000'000.0) * 100.0
                         : -1.0;
 
+                const uint64_t renderThreadCpuNowNs = renderThreadCpuTimeNs();
+                const double renderThreadCpuPercent =
+                    sampleRenderThreadCpuStartNs > 0 &&
+                    renderThreadCpuNowNs >= sampleRenderThreadCpuStartNs
+                        ? static_cast<double>(
+                            renderThreadCpuNowNs - sampleRenderThreadCpuStartNs
+                        ) / (elapsedSeconds * 1'000'000'000.0) * 100.0
+                        : -1.0;
+
                 double kgslBusyPercent = 0.0;
                 const bool hasKgslBusyPercent =
                     readKgslGpuBusyPercent(kgslBusyPercent);
@@ -1701,6 +1819,20 @@ private:
                     metrics << " | gpuMaxMs=unsupported";
                 }
 
+                metrics << " | renderThreadCpuPct=";
+                if (renderThreadCpuPercent >= 0.0) {
+                    metrics << renderThreadCpuPercent;
+                } else {
+                    metrics << "unavailable";
+                }
+
+                appendTimingStats(metrics, "frameFenceWait", frameFenceWaitStats);
+                appendTimingStats(metrics, "imageFenceWait", imageFenceWaitStats);
+                appendTimingStats(metrics, "acquire", imageAcquireStats);
+                appendTimingStats(metrics, "commandRecord", commandRecordStats);
+                appendTimingStats(metrics, "queueSubmit", queueSubmitStats);
+                appendTimingStats(metrics, "present", presentStats);
+
                 metrics << " | gpuFrames=" << sampleGpuFrames
                         << " | kgslBusyPctLastWindow=";
                 if (hasKgslBusyPercent) {
@@ -1718,6 +1850,14 @@ private:
                 sampleGpuMaxMs = 0.0;
                 sampleGpuFrames = 0;
                 sampleProcessCpuStartNs = processCpuNowNs;
+                sampleRenderThreadCpuStartNs = renderThreadCpuNowNs;
+
+                frameFenceWaitStats.reset();
+                imageFenceWaitStats.reset();
+                imageAcquireStats.reset();
+                commandRecordStats.reset();
+                queueSubmitStats.reset();
+                presentStats.reset();
             }
         }
     }
