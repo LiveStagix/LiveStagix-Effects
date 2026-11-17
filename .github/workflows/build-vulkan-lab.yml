@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - renderer-foundation
   workflow_dispatch:
 
 permissions:
