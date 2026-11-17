@@ -3,6 +3,10 @@ package com.livestagix.vulkantest
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
 import com.livestagix.renderer.api.RendererBackend
+import com.livestagix.renderer.api.RendererCreateConfig
+import com.livestagix.renderer.api.RendererCreateRequest
+import com.livestagix.renderer.api.RendererFailureCategory
+import com.livestagix.renderer.api.RendererException
 import com.livestagix.renderer.api.RendererSession
 import com.livestagix.renderer.backends.vulkan.VulkanRendererBackend
 import java.util.concurrent.atomic.AtomicInteger
@@ -61,33 +65,34 @@ class VulkanWallpaperService : WallpaperService() {
             )
             stopRenderer()
 
-            if (!holder.surface.isValid) {
-                EventRecorder.record(
-                    "ERROR",
-                    "SURFACE",
-                    "Invalid wallpaper surface for engine=${engineId}"
-                )
-                return
-            }
-
             var startedSession: RendererSession? = null
             runCatching {
-                val session = rendererBackend.createSession(holder.surface, assets)
+                val session = rendererBackend.createSession(
+                    RendererCreateRequest(
+                        surface = holder.surface,
+                        assets = assets,
+                        config = RendererCreateConfig(initiallyPaused = !isVisible)
+                    )
+                )
                 startedSession = session
                 rendererSession = session
                 EventRecorder.record(
                     "INFO",
-                    "VULKAN",
+                    session.backendType.name,
                     "Renderer attached to engine=${engineId}, backend=${session.backendType}"
                 )
-                session.setPaused(!isVisible)
             }.onFailure {
                 startedSession?.let { session -> runCatching { session.close() } }
                 rendererSession = null
+
+                val failure = (it as? RendererException)?.failure
+                val category = failure?.category ?: RendererFailureCategory.UNKNOWN
+                val message = failure?.message ?: it.message ?: "Unknown renderer error"
                 EventRecorder.record(
                     "ERROR",
                     "WALLPAPER",
-                    "Could not start ${rendererBackend.type} renderer for engine=${engineId}: ${it.message}"
+                    "Could not start ${rendererBackend.type} renderer for engine=${engineId}; " +
+                        "category=${category}: ${message}"
                 )
             }
         }
@@ -174,7 +179,7 @@ class VulkanWallpaperService : WallpaperService() {
             }
             EventRecorder.record(
                 "INFO",
-                "VULKAN",
+                session.backendType.name,
                 "Renderer detached from engine=${engineId}, backend=${session.backendType}"
             )
         }

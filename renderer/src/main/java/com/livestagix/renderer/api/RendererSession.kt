@@ -7,6 +7,9 @@ package com.livestagix.renderer.api
 interface RendererSession : AutoCloseable {
     val backendType: RendererType
 
+    /** Structured device capabilities, when exposed by the backend. */
+    val capabilities: RendererCapabilities?
+
     fun resize(width: Int, height: Int)
 
     fun setPaused(paused: Boolean)
