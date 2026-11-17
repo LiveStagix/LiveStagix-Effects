@@ -79,7 +79,7 @@ jobs:
             -storepass "$VULKAN_LAB_KEYSTORE_PASSWORD" \
             -alias "$VULKAN_LAB_KEY_ALIAS" > /dev/null
 
-          printf 'VULKAN_LAB_KEYSTORE_FILE=%s\\n' "$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          printf 'VULKAN_LAB_KEYSTORE_FILE=%s\n' "$KEYSTORE_PATH" >> "$GITHUB_ENV"
 
       - name: Build debug APK and optimized release bundle
         env:
@@ -109,9 +109,9 @@ jobs:
 
           echo "Release package and version:"
           RELEASE_BADGING="$("$AAPT" dump badging "$RELEASE_APK_PATH")"
-          printf '%s\\n' "$RELEASE_BADGING" | grep -m1 "^package:"
+          printf '%s\n' "$RELEASE_BADGING" | grep -m1 "^package:"
 
-          if printf '%s\\n' "$RELEASE_BADGING" | grep -q "application-debuggable"; then
+          if printf '%s\n' "$RELEASE_BADGING" | grep -q "application-debuggable"; then
             echo "ERROR: Release APK is marked debuggable."
             exit 1
           fi
@@ -124,8 +124,8 @@ jobs:
 
             "$APKSIGNER" verify "$apk_path"
             cert_output="$("$APKSIGNER" verify --print-certs "$apk_path")"
-            printf '%s\\n' "$cert_output"
-            actual_cert_sha256="$(printf '%s\\n' "$cert_output" | awk '/Signer #1 certificate SHA-256 digest:/ { gsub(\":\", \"\", $NF); print tolower($NF); exit }')"
+            printf '%s\n' "$cert_output"
+            actual_cert_sha256="$(printf '%s\n' "$cert_output" | awk '/Signer #1 certificate SHA-256 digest:/ { gsub(":", "", $NF); print tolower($NF); exit }')"
 
             if [ "$actual_cert_sha256" != "$EXPECTED_CERT_SHA256" ]; then
               echo "ERROR: $apk_path was not signed with the dedicated Vulkan Lab certificate."
@@ -142,8 +142,8 @@ jobs:
           echo "Release AAB signature:"
           jarsigner -verify "$AAB_PATH" > /dev/null
           AAB_CERT_OUTPUT="$(keytool -printcert -jarfile "$AAB_PATH")"
-          printf '%s\\n' "$AAB_CERT_OUTPUT"
-          ACTUAL_AAB_CERT_SHA256="$(printf '%s\\n' "$AAB_CERT_OUTPUT" | awk '/SHA256:/ { gsub(\":\", \"\", $2); print tolower($2); exit }')"
+          printf '%s\n' "$AAB_CERT_OUTPUT"
+          ACTUAL_AAB_CERT_SHA256="$(printf '%s\n' "$AAB_CERT_OUTPUT" | awk '/SHA256:/ { gsub(\":\", \"\", $2); print tolower($2); exit }')"
 
           if [ "$ACTUAL_AAB_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
             echo "ERROR: AAB was not signed with the dedicated Vulkan Lab certificate."
