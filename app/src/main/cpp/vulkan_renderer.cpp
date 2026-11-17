@@ -1791,6 +1791,7 @@ private:
 
             imagesInFlight_[imageIndex] = frame.inFlightFence;
             frame.timestampPending = timestampQueriesSupported_;
+            const uint32_t submittedFrameIndex = frameIndex;
             frameIndex = (frameIndex + 1) % kMaxFramesInFlight;
 
             VkPresentInfoKHR presentInfo{};
@@ -1830,6 +1831,41 @@ private:
                 requireVk(presentResult, "vkQueuePresentKHR");
             }
 
+            uint64_t healthProbeDurationNs = 0;
+            const char* healthProbeTimingSource = "unavailable";
+            if (healthProbe) {
+                // A health probe must be measured after its own GPU submission
+                // completes. Queue submission/presentation host time alone can
+                // return before asynchronous GPU work has finished.
+                const VkResult probeFenceWaitResult = vkWaitForFences(
+                    device_,
+                    1,
+                    &frames_[submittedFrameIndex].inFlightFence,
+                    VK_TRUE,
+                    UINT64_MAX
+                );
+                const auto probeFenceComplete = Clock::now();
+                requireVk(probeFenceWaitResult, "vkWaitForFences(health probe)");
+
+                double probeGpuFrameMs = 0.0;
+                if (collectGpuTimestamp(submittedFrameIndex, probeGpuFrameMs)) {
+                    healthProbeDurationNs = static_cast<uint64_t>(
+                        probeGpuFrameMs * 1'000'000.0
+                    );
+                    healthProbeTimingSource = "gpuTimestamp";
+                } else {
+                    // Timestamp queries are optional on Vulkan devices. The
+                    // completed fence still gives us a conservative fallback
+                    // for this isolated probe, measured from submission start.
+                    healthProbeDurationNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            probeFenceComplete - queueSubmitStart
+                        ).count()
+                    );
+                    healthProbeTimingSource = "submitToFence";
+                }
+            }
+
             const auto frameEnd = Clock::now();
             const uint64_t renderDurationNs = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1854,14 +1890,20 @@ private:
                 1'000'000'000ULL / static_cast<uint64_t>(effectiveTargetFps);
 
             if (healthProbe) {
+                const uint64_t probeThresholdNs =
+                    (frameBudgetNs * kHealthProbeBudgetPercent) / 100ULL;
                 const bool probeSlow =
-                    renderDurationNs > (frameBudgetNs * kHealthProbeBudgetPercent) / 100ULL;
+                    healthProbeDurationNs > probeThresholdNs;
+                const double probeDurationMs =
+                    static_cast<double>(healthProbeDurationNs) / 1'000'000.0;
                 if (!probeSlow) {
                     ++recoveryGoodProbes;
                     emitLog(
                         "INFO",
-                        "GPU protection health probe passed: " +
-                            std::to_string(recoveryGoodProbes) + "/" +
+                        "GPU protection health probe passed: probeMs=" +
+                            std::to_string(probeDurationMs) +
+                            " | timing=" + healthProbeTimingSource +
+                            " | " + std::to_string(recoveryGoodProbes) + "/" +
                             std::to_string(kHealthProbesToResume)
                     );
                     if (recoveryGoodProbes >= kHealthProbesToResume) {
@@ -1884,9 +1926,12 @@ private:
                     recoveryGoodProbes = 0;
                     emitLog(
                         "WARN",
-                        "GPU protection health probe still strained: renderMs=" +
+                        "GPU protection health probe still strained: probeMs=" +
+                            std::to_string(probeDurationMs) +
+                            " | timing=" + healthProbeTimingSource +
+                            " | thresholdMs=" +
                             std::to_string(
-                                static_cast<double>(renderDurationNs) / 1'000'000.0
+                                static_cast<double>(probeThresholdNs) / 1'000'000.0
                             ) +
                             " | targetFps=" + std::to_string(effectiveTargetFps)
                     );
