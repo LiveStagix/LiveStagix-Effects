@@ -2,24 +2,25 @@ package com.livestagix.vulkantest
 
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
-import com.livestagix.renderer.NativeVulkanRenderer
+import com.livestagix.renderer.api.RendererBackend
+import com.livestagix.renderer.api.RendererSession
+import com.livestagix.renderer.backends.vulkan.VulkanRendererBackend
 import java.util.concurrent.atomic.AtomicInteger
 
 class VulkanWallpaperService : WallpaperService() {
-    private var nativeLibraryLoaded = false
+    private val rendererBackend: RendererBackend = VulkanRendererBackend()
 
     override fun onCreate() {
         super.onCreate()
         EventRecorder.initialize(this)
-        NativeVulkanRenderer.setLogListener { level, message ->
+        rendererBackend.setLogListener { level, message ->
             EventRecorder.record(level, "VULKAN", message)
         }
-        nativeLibraryLoaded = NativeVulkanRenderer.load()
         EventRecorder.record("INFO", "WALLPAPER", "Wallpaper service created")
     }
 
     override fun onDestroy() {
-        NativeVulkanRenderer.setLogListener(null)
+        rendererBackend.setLogListener(null)
         super.onDestroy()
     }
 
@@ -35,7 +36,7 @@ class VulkanWallpaperService : WallpaperService() {
 
     inner class VulkanEngine : Engine() {
         val engineId: Int = nextEngineId.incrementAndGet()
-        private var rendererHandle = 0L
+        private var rendererSession: RendererSession? = null
         private var previewEngine = false
 
         override fun onCreate(surfaceHolder: SurfaceHolder) {
@@ -60,15 +61,6 @@ class VulkanWallpaperService : WallpaperService() {
             )
             stopRenderer()
 
-            if (!nativeLibraryLoaded) {
-                EventRecorder.record(
-                    "ERROR",
-                    "WALLPAPER",
-                    "Renderer unavailable for engine=${engineId}: native library is not loaded"
-                )
-                return
-            }
-
             if (!holder.surface.isValid) {
                 EventRecorder.record(
                     "ERROR",
@@ -78,28 +70,24 @@ class VulkanWallpaperService : WallpaperService() {
                 return
             }
 
-            var startedHandle = 0L
+            var startedSession: RendererSession? = null
             runCatching {
-                startedHandle = NativeVulkanRenderer.nativeStart(holder.surface, assets)
-                check(startedHandle != 0L) {
-                    "Native Vulkan renderer returned an invalid handle"
-                }
-                rendererHandle = startedHandle
+                val session = rendererBackend.createSession(holder.surface, assets)
+                startedSession = session
+                rendererSession = session
                 EventRecorder.record(
                     "INFO",
                     "VULKAN",
-                    "Renderer attached to engine=${engineId}, handle=${startedHandle}"
+                    "Renderer attached to engine=${engineId}, backend=${session.backendType}"
                 )
-                NativeVulkanRenderer.nativeSetPaused(startedHandle, !isVisible)
+                session.setPaused(!isVisible)
             }.onFailure {
-                if (startedHandle != 0L) {
-                    runCatching { NativeVulkanRenderer.nativeStop(startedHandle) }
-                }
-                rendererHandle = 0L
+                startedSession?.let { session -> runCatching { session.close() } }
+                rendererSession = null
                 EventRecorder.record(
                     "ERROR",
                     "WALLPAPER",
-                    "Could not start Vulkan renderer for engine=${engineId}: ${it.message}"
+                    "Could not start ${rendererBackend.type} renderer for engine=${engineId}: ${it.message}"
                 )
             }
         }
@@ -118,17 +106,15 @@ class VulkanWallpaperService : WallpaperService() {
                     "engine=${engineId}, isPreview=${isPreview()}, valid=${holder.surface.isValid}"
             )
 
-            val handle = rendererHandle
-            if (handle != 0L) {
-                runCatching {
-                    NativeVulkanRenderer.nativeResize(handle, width, height)
-                }.onFailure {
-                    EventRecorder.record(
-                        "ERROR",
-                        "SURFACE",
-                        "Could not resize renderer for engine=${engineId}, handle=${handle}: ${it.message}"
-                    )
-                }
+            val session = rendererSession ?: return
+            runCatching {
+                session.resize(width, height)
+            }.onFailure {
+                EventRecorder.record(
+                    "ERROR",
+                    "SURFACE",
+                    "Could not resize ${session.backendType} renderer for engine=${engineId}: ${it.message}"
+                )
             }
         }
 
@@ -138,21 +124,18 @@ class VulkanWallpaperService : WallpaperService() {
                 "INFO",
                 "WALLPAPER",
                 "Visibility changed: visible=${visible}, engine=${engineId}, " +
-                    "isPreview=${isPreview()}, rendererHandle=${rendererHandle}"
+                    "isPreview=${isPreview()}, backend=${rendererSession?.backendType ?: "none"}"
             )
 
-            val handle = rendererHandle
-            if (handle != 0L) {
-                runCatching {
-                    NativeVulkanRenderer.nativeSetPaused(handle, !visible)
-                }.onFailure {
-                    EventRecorder.record(
-                        "ERROR",
-                        "WALLPAPER",
-                        "Could not update renderer visibility for engine=${engineId}, " +
-                            "handle=${handle}: ${it.message}"
-                    )
-                }
+            val session = rendererSession ?: return
+            runCatching {
+                session.setPaused(!visible)
+            }.onFailure {
+                EventRecorder.record(
+                    "ERROR",
+                    "WALLPAPER",
+                    "Could not update ${session.backendType} renderer visibility for engine=${engineId}: ${it.message}"
+                )
             }
         }
 
@@ -177,23 +160,22 @@ class VulkanWallpaperService : WallpaperService() {
         }
 
         private fun stopRenderer() {
-            val handle = rendererHandle
-            if (handle == 0L) return
-            rendererHandle = 0L
+            val session = rendererSession ?: return
+            rendererSession = null
 
             runCatching {
-                NativeVulkanRenderer.nativeStop(handle)
+                session.close()
             }.onFailure {
                 EventRecorder.record(
                     "ERROR",
                     "WALLPAPER",
-                    "Could not stop renderer for engine=${engineId}, handle=${handle}: ${it.message}"
+                    "Could not stop ${session.backendType} renderer for engine=${engineId}: ${it.message}"
                 )
             }
             EventRecorder.record(
                 "INFO",
                 "VULKAN",
-                "Renderer detached from engine=${engineId}, handle=${handle}"
+                "Renderer detached from engine=${engineId}, backend=${session.backendType}"
             )
         }
     }
