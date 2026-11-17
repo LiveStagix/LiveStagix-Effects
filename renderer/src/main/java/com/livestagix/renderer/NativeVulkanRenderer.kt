@@ -1,4 +1,4 @@
-package com.livestagix.vulkantest
+package com.livestagix.renderer
 
 import android.content.res.AssetManager
 import android.view.Surface
@@ -27,7 +27,7 @@ object NativeVulkanRenderer {
         if (libraryLoaded) return true
 
         return runCatching {
-            System.loadLibrary("vulkan_test")
+            System.loadLibrary("livestagix_renderer")
             libraryLoaded = true
             true
         }.getOrElse {

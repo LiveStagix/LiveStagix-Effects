@@ -2,6 +2,7 @@ package com.livestagix.vulkantest
 
 import android.service.wallpaper.WallpaperService
 import android.view.SurfaceHolder
+import com.livestagix.renderer.NativeVulkanRenderer
 import java.util.concurrent.atomic.AtomicInteger
 
 class VulkanWallpaperService : WallpaperService() {

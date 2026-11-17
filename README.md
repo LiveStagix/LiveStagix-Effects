@@ -2,11 +2,19 @@
 
 A small Android Vulkan test app kept separate from LiveWP.
 
-The project now tests the same Vulkan triangle renderer in two Android environments:
+The project tests the reusable Vulkan renderer library in two Android environments:
 - A Vulkan test surface during the initial renderer milestone.
 - A real Android WallpaperService surface for live-wallpaper lifecycle testing.
 
 The wallpaper is deliberately a minimal mock. It validates Android wallpaper integration; it is not yet the production LiveStagix renderer and does not include visual effects.
+
+## Project structure
+
+- `renderer/` is an Android library containing the reusable Kotlin/JNI bridge, native Vulkan implementation, CMake build and shader sources. Its compiled shader assets are packaged into consuming apps.
+- `app/` is the Vulkan Lab host. It contains the test Activity, WallpaperService and Event Recorder, and depends on `:renderer`.
+- The renderer library currently contains the Vulkan backend only. OpenGL ES 3.0 and 2.0 backends are separate planned implementations; they are not added by this migration.
+
+LiveWP is not modified by this repository migration.
 
 ## Run the wallpaper test
 
@@ -53,7 +61,7 @@ The initial APK targets arm64-v8a, matching the first test device.
 - Vulkan API 1.0 is requested by the app for broad compatibility. The detected GPU's supported API version is logged separately.
 - The renderer uses the guaranteed FIFO presentation mode.
 - The first pass does not include a Vulkan validation layer or GPU timestamp queries.
-- Only one native Vulkan renderer instance is managed by the test app.
+- The Lab can host independent native Vulkan renderer instances for the preview and installed wallpaper engines.
 - This mock tests Android's wallpaper service and surface lifecycle; it does not prove production readiness for all Android devices.
 - No OpenGL ES code in LiveWP is changed or replaced.
 - No visual effects or downloadable effect packages are included yet.

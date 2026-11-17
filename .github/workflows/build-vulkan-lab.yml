@@ -41,15 +41,15 @@ jobs:
 
       - name: Compile Vulkan shaders
         run: |
-          mkdir -p app/src/main/assets/shaders
-          glslc --target-env=vulkan1.0 app/src/main/shaders/triangle.vert -o app/src/main/assets/shaders/triangle.vert.spv
-          glslc --target-env=vulkan1.0 app/src/main/shaders/triangle.frag -o app/src/main/assets/shaders/triangle.frag.spv
-          glslc --target-env=vulkan1.0 app/src/main/shaders/vortex.vert -o app/src/main/assets/shaders/vortex.vert.spv
-          glslc --target-env=vulkan1.0 app/src/main/shaders/vortex.frag -o app/src/main/assets/shaders/vortex.frag.spv
-          test -s app/src/main/assets/shaders/triangle.vert.spv
-          test -s app/src/main/assets/shaders/triangle.frag.spv
-          test -s app/src/main/assets/shaders/vortex.vert.spv
-          test -s app/src/main/assets/shaders/vortex.frag.spv
+          mkdir -p renderer/src/main/assets/shaders
+          glslc --target-env=vulkan1.0 renderer/src/main/shaders/triangle.vert -o renderer/src/main/assets/shaders/triangle.vert.spv
+          glslc --target-env=vulkan1.0 renderer/src/main/shaders/triangle.frag -o renderer/src/main/assets/shaders/triangle.frag.spv
+          glslc --target-env=vulkan1.0 renderer/src/main/shaders/vortex.vert -o renderer/src/main/assets/shaders/vortex.vert.spv
+          glslc --target-env=vulkan1.0 renderer/src/main/shaders/vortex.frag -o renderer/src/main/assets/shaders/vortex.frag.spv
+          test -s renderer/src/main/assets/shaders/triangle.vert.spv
+          test -s renderer/src/main/assets/shaders/triangle.frag.spv
+          test -s renderer/src/main/assets/shaders/vortex.vert.spv
+          test -s renderer/src/main/assets/shaders/vortex.frag.spv
 
       - name: Install Android build components
         run: |

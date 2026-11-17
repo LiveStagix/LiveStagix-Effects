@@ -18,7 +18,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import java.lang.ref.WeakReference
 
 class MainActivity : Activity() {
     private lateinit var statusLabel: TextView
@@ -30,7 +29,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         EventRecorder.initialize(this)
-        activeActivity = WeakReference(this)
 
         window.statusBarColor = Color.rgb(10, 12, 18)
         window.navigationBarColor = Color.rgb(10, 12, 18)
@@ -343,7 +341,6 @@ class MainActivity : Activity() {
         wallpaperReturnVerificationRunnable?.let(mainHandler::removeCallbacks)
         wallpaperReturnVerificationRunnable = null
         EventRecorder.setListener(null)
-        if (activeActivity?.get() === this) activeActivity = null
         super.onDestroy()
     }
 
@@ -362,30 +359,5 @@ class MainActivity : Activity() {
         private const val PREF_OWNS_LOCK = "wallpaper_return_verification_owns_lock"
         private const val WALLPAPER_RETURN_VERIFICATION_DELAY_MS = 3_000L
 
-        private var activeActivity: WeakReference<MainActivity>? = null
-
-        @JvmStatic
-        fun onNativeLog(level: String, message: String) {
-            EventRecorder.record(level, "VULKAN", message)
-            val activity = activeActivity?.get() ?: return
-
-            activity.runOnUiThread {
-                if (!activity::statusLabel.isInitialized) return@runOnUiThread
-
-                activity.statusLabel.text = when {
-                    level.equals("ERROR", ignoreCase = true) ->
-                        "Wallpaper status: error — $message"
-                    message.startsWith("READY:") ->
-                        "Wallpaper status: rendering — ${message.removePrefix("READY:").trim()}"
-                    message.contains("Renderer paused", ignoreCase = true) ->
-                        "Wallpaper status: paused"
-                    message.contains("Renderer resumed", ignoreCase = true) ->
-                        "Wallpaper status: rendering"
-                    message.startsWith("Renderer stopped") ->
-                        "Wallpaper status: stopped"
-                    else -> activity.statusLabel.text
-                }
-            }
-        }
     }
 }

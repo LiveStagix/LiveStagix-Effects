@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "LiveStagix-Vulkan-Lab"
-include(":app")
+include(":app", ":renderer")

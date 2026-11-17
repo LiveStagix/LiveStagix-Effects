@@ -5,7 +5,6 @@ plugins {
 android {
     namespace = "com.livestagix.vulkantest"
     compileSdk = 36
-    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.livestagix.vulkantest"
@@ -18,11 +17,6 @@ android {
             abiFilters += "arm64-v8a"
         }
 
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-            }
-        }
     }
 
     buildTypes {
@@ -31,9 +25,8 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-        }
-    }
+}
+
+dependencies {
+    implementation(project(":renderer"))
 }
