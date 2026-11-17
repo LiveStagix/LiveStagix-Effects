@@ -1,3 +1,5 @@
+import java.io.File
+
 plugins {
     id("com.android.application")
 }
@@ -8,7 +10,7 @@ val buildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER")
     ?: 1
 
 val labKeystorePath = providers.environmentVariable("VULKAN_LAB_KEYSTORE_FILE").orNull
-val labKeystoreFile = labKeystorePath?.let { java.io.File(it) }
+val labKeystoreFile = labKeystorePath?.let { File(it) }
 val labStorePassword = providers.environmentVariable("VULKAN_LAB_KEYSTORE_PASSWORD").orNull
 val labKeyAlias = providers.environmentVariable("VULKAN_LAB_KEY_ALIAS").orNull
 val labKeyPassword = providers.environmentVariable("VULKAN_LAB_KEY_PASSWORD").orNull
