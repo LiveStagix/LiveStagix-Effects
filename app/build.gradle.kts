@@ -66,7 +66,15 @@ android {
         }
 
         release {
-            isMinifyEnabled = false
+            isDebuggable = false
+
+            if (hasLabSigning) {
+                signingConfig = signingConfigs.getByName("vulkanLab")
+            }
+
+            optimization {
+                enable = true
+            }
         }
     }
 }
