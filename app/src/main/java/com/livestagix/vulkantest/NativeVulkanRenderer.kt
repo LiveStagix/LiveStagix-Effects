@@ -10,6 +10,18 @@ object NativeVulkanRenderer {
     @Volatile
     private var libraryLoaded = false
 
+    @Volatile
+    private var logListener: ((level: String, message: String) -> Unit)? = null
+
+    fun setLogListener(listener: ((level: String, message: String) -> Unit)?) {
+        logListener = listener
+    }
+
+    @JvmStatic
+    fun onNativeLog(level: String, message: String) {
+        logListener?.invoke(level, message)
+    }
+
     @Synchronized
     fun load(): Boolean {
         if (libraryLoaded) return true
@@ -19,9 +31,8 @@ object NativeVulkanRenderer {
             libraryLoaded = true
             true
         }.getOrElse {
-            EventRecorder.record(
+            onNativeLog(
                 "ERROR",
-                "VULKAN",
                 "Could not load native renderer library: ${it.message}"
             )
             false

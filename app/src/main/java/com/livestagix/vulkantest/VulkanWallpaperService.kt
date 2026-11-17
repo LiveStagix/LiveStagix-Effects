@@ -10,8 +10,16 @@ class VulkanWallpaperService : WallpaperService() {
     override fun onCreate() {
         super.onCreate()
         EventRecorder.initialize(this)
+        NativeVulkanRenderer.setLogListener { level, message ->
+            EventRecorder.record(level, "VULKAN", message)
+        }
         nativeLibraryLoaded = NativeVulkanRenderer.load()
         EventRecorder.record("INFO", "WALLPAPER", "Wallpaper service created")
+    }
+
+    override fun onDestroy() {
+        NativeVulkanRenderer.setLogListener(null)
+        super.onDestroy()
     }
 
     override fun onCreateEngine(): Engine {

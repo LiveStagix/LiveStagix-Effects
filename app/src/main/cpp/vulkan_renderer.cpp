@@ -77,7 +77,7 @@ void appendTimingStats(
 }
 
 JavaVM* gJavaVm = nullptr;
-jclass gActivityClass = nullptr;
+jclass gRendererBridgeClass = nullptr;
 jmethodID gNativeLogMethod = nullptr;
 
 void emitLog(const char* level, const std::string& message) {
@@ -87,7 +87,7 @@ void emitLog(const char* level, const std::string& message) {
     if (std::strcmp(level, "DEBUG") == 0) priority = ANDROID_LOG_DEBUG;
     __android_log_print(priority, kLogTag, "%s", message.c_str());
 
-    if (gJavaVm == nullptr || gActivityClass == nullptr || gNativeLogMethod == nullptr) {
+    if (gJavaVm == nullptr || gRendererBridgeClass == nullptr || gNativeLogMethod == nullptr) {
         return;
     }
 
@@ -111,7 +111,7 @@ void emitLog(const char* level, const std::string& message) {
     jstring javaMessage = env->NewStringUTF(message.c_str());
     if (javaLevel != nullptr && javaMessage != nullptr) {
         env->CallStaticVoidMethod(
-            gActivityClass,
+            gRendererBridgeClass,
             gNativeLogMethod,
             javaLevel,
             javaMessage
@@ -2275,18 +2275,20 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         return JNI_ERR;
     }
 
-    jclass localClass = env->FindClass("com/livestagix/vulkantest/MainActivity");
+    jclass localClass = env->FindClass(
+        "com/livestagix/vulkantest/NativeVulkanRenderer"
+    );
     if (localClass == nullptr) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         return JNI_ERR;
     }
 
-    gActivityClass = static_cast<jclass>(env->NewGlobalRef(localClass));
+    gRendererBridgeClass = static_cast<jclass>(env->NewGlobalRef(localClass));
     env->DeleteLocalRef(localClass);
-    if (gActivityClass == nullptr) return JNI_ERR;
+    if (gRendererBridgeClass == nullptr) return JNI_ERR;
 
     gNativeLogMethod = env->GetStaticMethodID(
-        gActivityClass,
+        gRendererBridgeClass,
         "onNativeLog",
         "(Ljava/lang/String;Ljava/lang/String;)V"
     );
