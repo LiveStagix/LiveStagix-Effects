@@ -59,6 +59,20 @@ jobs:
       - name: Build debug APK
         run: gradle --no-daemon assembleDebug
 
+      - name: Report APK and signing fingerprints
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          APKSIGNER="${ANDROID_HOME}/build-tools/36.0.0/apksigner"
+
+          test -s "$APK_PATH"
+          test -x "$APKSIGNER"
+
+          echo "APK SHA-256:"
+          sha256sum "$APK_PATH"
+
+          echo "Signing certificate fingerprints:"
+          "$APKSIGNER" verify --print-certs "$APK_PATH"
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
