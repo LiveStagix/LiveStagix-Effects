@@ -1616,6 +1616,14 @@ private:
             );
             requireVk(frameFenceWaitResult, "vkWaitForFences(frame slot)");
 
+            // The frame fence has completed; remove stale image references
+            // before this fence is reset and reused for another submission.
+            for (VkFence& imageFence : imagesInFlight_) {
+                if (imageFence == frame.inFlightFence) {
+                    imageFence = VK_NULL_HANDLE;
+                }
+            }
+
             double completedGpuFrameMs = 0.0;
             if (collectGpuTimestamp(frameIndex, completedGpuFrameMs)) {
                 sampleGpuFrameMs += completedGpuFrameMs;
