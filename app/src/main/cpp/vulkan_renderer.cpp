@@ -1504,6 +1504,48 @@ private:
         TimingStats queueSubmitStats;
         TimingStats presentStats;
 
+        // Match LiveStagix runtime protection: progressively lower the render
+        // cadence, then pause sustained overload and periodically health-check.
+        constexpr int kNormalTargetFps = 60;
+        constexpr int kMinimumTargetFps = 30;
+        constexpr uint64_t kStrainRenderBudgetPercent = 70;
+        constexpr uint64_t kStrainFrameIntervalPercent = 135;
+        constexpr uint64_t kHealthProbeBudgetPercent = 120;
+        constexpr uint64_t kRecoveryRenderBudgetPercent = 65;
+        constexpr uint32_t kMinimumTimingSamples = 20;
+        constexpr uint32_t kHealthProbesToResume = 3;
+        constexpr auto kRenderStrainConfirm = std::chrono::seconds(1);
+        constexpr auto kHardPauseConfirm = std::chrono::milliseconds(2500);
+        constexpr auto kThrottleHysteresis = std::chrono::seconds(3);
+        constexpr auto kRecoveryConfirm = std::chrono::seconds(4);
+        constexpr auto kHealthProbeInterval = std::chrono::seconds(2);
+
+        auto stepDownTargetFps = [](int current) {
+            constexpr int ladder[] = {90, 60, 45, 30};
+            for (int value : ladder) {
+                if (value < current) return value;
+            }
+            return kMinimumTargetFps;
+        };
+        auto stepUpTargetFps = [](int current, int normal) {
+            constexpr int ladder[] = {30, 45, 60, 90};
+            for (int value : ladder) {
+                if (value > current) return std::min(normal, value);
+            }
+            return normal;
+        };
+
+        int effectiveTargetFps = kNormalTargetFps;
+        uint32_t timingSampleCount = 0;
+        uint32_t recoveryGoodProbes = 0;
+        bool autoPaused = false;
+        Clock::time_point slowSince{};
+        Clock::time_point stableSince{};
+        Clock::time_point lastThrottleChange{};
+        Clock::time_point lastFrameEnd{};
+        Clock::time_point nextFrameDeadline{};
+        Clock::time_point healthProbeDue{};
+
         bool wasPaused = false;
         bool swapchainOutOfDate = false;
         bool acquireSuboptimalLogged = false;
@@ -1541,6 +1583,14 @@ private:
                 commandRecordStats.reset();
                 queueSubmitStats.reset();
                 presentStats.reset();
+                timingSampleCount = 0;
+                slowSince = Clock::time_point{};
+                stableSince = Clock::time_point{};
+                lastFrameEnd = Clock::time_point{};
+                nextFrameDeadline = Clock::time_point{};
+                if (autoPaused) {
+                    healthProbeDue = Clock::now() + kHealthProbeInterval;
+                }
 
                 emitLog("INFO", "Renderer resumed");
                 wasPaused = false;
@@ -1600,6 +1650,21 @@ private:
                     acquireSuboptimalLogged = false;
                     presentSuboptimalLogged = false;
                 }
+            }
+
+            bool healthProbe = false;
+            if (autoPaused) {
+                const auto now = Clock::now();
+                if (now < healthProbeDue) {
+                    const auto wakeAt = std::min(
+                        healthProbeDue,
+                        now + std::chrono::milliseconds(100)
+                    );
+                    std::this_thread::sleep_until(wakeAt);
+                    continue;
+                }
+                healthProbe = true;
+                emitLog("DEBUG", "GPU protection health probe started");
             }
 
             const auto frameStart = Clock::now();
@@ -1766,10 +1831,161 @@ private:
             }
 
             const auto frameEnd = Clock::now();
+            const uint64_t renderDurationNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    frameEnd - frameStart
+                ).count()
+            );
+            const uint64_t frameIntervalNs = lastFrameEnd == Clock::time_point{}
+                ? 0ULL
+                : static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frameEnd - lastFrameEnd
+                    ).count()
+                );
+            lastFrameEnd = frameEnd;
+
             const double frameMs =
                 std::chrono::duration<double, std::milli>(frameEnd - frameStart).count();
             sampleFrameWallMs += frameMs;
             ++sampleFrames;
+
+            const uint64_t frameBudgetNs =
+                1'000'000'000ULL / static_cast<uint64_t>(effectiveTargetFps);
+
+            if (healthProbe) {
+                const bool probeSlow =
+                    renderDurationNs > (frameBudgetNs * kHealthProbeBudgetPercent) / 100ULL;
+                if (!probeSlow) {
+                    ++recoveryGoodProbes;
+                    emitLog(
+                        "INFO",
+                        "GPU protection health probe passed: " +
+                            std::to_string(recoveryGoodProbes) + "/" +
+                            std::to_string(kHealthProbesToResume)
+                    );
+                    if (recoveryGoodProbes >= kHealthProbesToResume) {
+                        autoPaused = false;
+                        recoveryGoodProbes = 0;
+                        effectiveTargetFps = kNormalTargetFps;
+                        timingSampleCount = 0;
+                        slowSince = Clock::time_point{};
+                        stableSince = Clock::time_point{};
+                        lastThrottleChange = frameEnd;
+                        nextFrameDeadline = Clock::time_point{};
+                        healthProbeDue = Clock::time_point{};
+                        emitLog(
+                            "INFO",
+                            "GPU protection recovered; normal render cadence restored to " +
+                                std::to_string(effectiveTargetFps) + " FPS"
+                        );
+                    }
+                } else {
+                    recoveryGoodProbes = 0;
+                    emitLog(
+                        "WARN",
+                        "GPU protection health probe still strained: renderMs=" +
+                            std::to_string(
+                                static_cast<double>(renderDurationNs) / 1'000'000.0
+                            ) +
+                            " | targetFps=" + std::to_string(effectiveTargetFps)
+                    );
+                }
+
+                if (autoPaused) {
+                    healthProbeDue = frameEnd + kHealthProbeInterval;
+                }
+            } else {
+                ++timingSampleCount;
+                if (timingSampleCount >= kMinimumTimingSamples && frameIntervalNs > 0) {
+                    const bool slow =
+                        frameIntervalNs >
+                            (frameBudgetNs * kStrainFrameIntervalPercent) / 100ULL ||
+                        renderDurationNs >
+                            (frameBudgetNs * kStrainRenderBudgetPercent) / 100ULL;
+
+                    const bool throttleCooldownComplete =
+                        lastThrottleChange == Clock::time_point{} ||
+                        frameEnd - lastThrottleChange >= kThrottleHysteresis;
+
+                    if (slow) {
+                        stableSince = Clock::time_point{};
+                        if (slowSince == Clock::time_point{}) slowSince = frameEnd;
+
+                        const auto requiredStrainDuration =
+                            effectiveTargetFps <= kMinimumTargetFps
+                                ? kHardPauseConfirm
+                                : kRenderStrainConfirm;
+
+                        if (frameEnd - slowSince >= requiredStrainDuration &&
+                            throttleCooldownComplete) {
+                            if (effectiveTargetFps > kMinimumTargetFps) {
+                                const int previousTargetFps = effectiveTargetFps;
+                                effectiveTargetFps =
+                                    stepDownTargetFps(effectiveTargetFps);
+                                lastThrottleChange = frameEnd;
+                                slowSince = Clock::time_point{};
+                                nextFrameDeadline = Clock::time_point{};
+
+                                emitLog(
+                                    "WARN",
+                                    "GPU protection throttled render cadence: fromFps=" +
+                                        std::to_string(previousTargetFps) +
+                                        " | toFps=" +
+                                        std::to_string(effectiveTargetFps) +
+                                        " | reason=sustained_render_strain"
+                                );
+                            } else {
+                                autoPaused = true;
+                                recoveryGoodProbes = 0;
+                                healthProbeDue = frameEnd + kHealthProbeInterval;
+                                nextFrameDeadline = Clock::time_point{};
+                                emitLog(
+                                    "WARN",
+                                    "GPU protection auto-paused Vulkan rendering after "
+                                    "sustained strain at 30 FPS; health probe interval=2000 ms"
+                                );
+                            }
+                        }
+                    } else {
+                        slowSince = Clock::time_point{};
+                        if (effectiveTargetFps < kNormalTargetFps) {
+                            if (stableSince == Clock::time_point{}) stableSince = frameEnd;
+                            if (frameEnd - stableSince >= kRecoveryConfirm &&
+                                throttleCooldownComplete) {
+                                const int candidateTargetFps =
+                                    stepUpTargetFps(effectiveTargetFps, kNormalTargetFps);
+                                const uint64_t candidateBudgetNs =
+                                    1'000'000'000ULL /
+                                    static_cast<uint64_t>(candidateTargetFps);
+                                const bool candidateHasHeadroom =
+                                    candidateTargetFps > effectiveTargetFps &&
+                                    renderDurationNs <=
+                                        (candidateBudgetNs *
+                                            kRecoveryRenderBudgetPercent) / 100ULL;
+                                if (candidateHasHeadroom) {
+                                    const int previousTargetFps = effectiveTargetFps;
+                                    effectiveTargetFps = candidateTargetFps;
+                                    lastThrottleChange = frameEnd;
+                                    stableSince = Clock::time_point{};
+                                    nextFrameDeadline = Clock::time_point{};
+                                    emitLog(
+                                        "INFO",
+                                        "GPU protection restored render cadence: fromFps=" +
+                                            std::to_string(previousTargetFps) +
+                                            " | toFps=" +
+                                            std::to_string(effectiveTargetFps)
+                                    );
+                                } else {
+                                    stableSince = Clock::time_point{};
+                                }
+                            }
+                        } else {
+                            stableSince = Clock::time_point{};
+                        }
+                    }
+                }
+            }
 
             const double elapsedSeconds =
                 std::chrono::duration<double>(frameEnd - sampleStart).count();
@@ -1834,6 +2050,10 @@ private:
                     metrics << "unavailable";
                 }
 
+                metrics << " | effectiveTargetFps=" << effectiveTargetFps
+                        << " | autoPaused=" << (autoPaused ? "true" : "false")
+                        << " | healthProbe=" << (healthProbe ? "true" : "false");
+
                 appendTimingStats(metrics, "frameFenceWait", frameFenceWaitStats);
                 appendTimingStats(metrics, "imageFenceWait", imageFenceWaitStats);
                 appendTimingStats(metrics, "acquire", imageAcquireStats);
@@ -1866,6 +2086,20 @@ private:
                 commandRecordStats.reset();
                 queueSubmitStats.reset();
                 presentStats.reset();
+            }
+
+            if (!autoPaused) {
+                const auto frameInterval =
+                    std::chrono::nanoseconds(1'000'000'000LL / effectiveTargetFps);
+                if (nextFrameDeadline == Clock::time_point{}) {
+                    nextFrameDeadline = frameEnd + frameInterval;
+                } else {
+                    nextFrameDeadline += frameInterval;
+                    if (nextFrameDeadline <= frameEnd) {
+                        nextFrameDeadline = frameEnd + frameInterval;
+                    }
+                }
+                std::this_thread::sleep_until(nextFrameDeadline);
             }
         }
     }
