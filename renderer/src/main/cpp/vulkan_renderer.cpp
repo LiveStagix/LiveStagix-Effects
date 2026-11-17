@@ -14,7 +14,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <time.h>
 #include <mutex>
@@ -376,23 +375,6 @@ private:
             static_cast<uint64_t>(cpuTime.tv_nsec);
     }
 
-    bool readKgslGpuBusyPercent(double& percent) const {
-        std::ifstream counter("/sys/class/kgsl/kgsl-3d0/gpubusy");
-        uint64_t busyTicks = 0;
-        uint64_t totalTicks = 0;
-
-        if (!(counter >> busyTicks >> totalTicks) || totalTicks == 0) {
-            return false;
-        }
-
-        percent = std::min(
-            100.0,
-            static_cast<double>(busyTicks) * 100.0 /
-                static_cast<double>(totalTicks)
-        );
-        return true;
-    }
-
     bool collectGpuTimestamp(uint32_t frameIndex, double& gpuFrameMs) {
         if (!timestampQueriesSupported_ ||
             frameIndex >= frames_.size() ||
@@ -474,19 +456,6 @@ private:
         createCommandPool();
         createFrameSync();
         createTimestampQueries();
-
-        double initialGpuBusyPercent = 0.0;
-        if (readKgslGpuBusyPercent(initialGpuBusyPercent)) {
-            emitLog(
-                "INFO",
-                "KGSL GPU busy counter is readable; it reports system-wide activity from the latest driver sample"
-            );
-        } else {
-            emitLog(
-                "INFO",
-                "KGSL GPU busy counter is unavailable to this app; GPU busy percentage will be reported as unavailable"
-            );
-        }
 
         emitLog(
             "INFO",
@@ -2059,10 +2028,6 @@ private:
                         ) / (elapsedSeconds * 1'000'000'000.0) * 100.0
                         : -1.0;
 
-                double kgslBusyPercent = 0.0;
-                const bool hasKgslBusyPercent =
-                    readKgslGpuBusyPercent(kgslBusyPercent);
-
                 std::ostringstream metrics;
                 metrics.setf(std::ios::fixed);
                 metrics.precision(1);
@@ -2107,13 +2072,7 @@ private:
                 appendTimingStats(metrics, "present", presentStats);
 
                 metrics << " | gpuFrames=" << sampleGpuFrames
-                        << " | kgslBusyPctLastWindow=";
-                if (hasKgslBusyPercent) {
-                    metrics << kgslBusyPercent;
-                } else {
-                    metrics << "unavailable";
-                }
-                metrics << " | frames=" << sampleFrames;
+                        << " | frames=" << sampleFrames;
                 emitLog("INFO", metrics.str());
 
                 sampleStart = frameEnd;
