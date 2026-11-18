@@ -2,12 +2,17 @@ package com.livestagix.renderer.effects
 
 import com.livestagix.renderer.api.RendererType
 
-/** Stable, API-neutral identity for a standalone or overlay visual effect. */
+/** Stable, API-neutral identity and defaults for a built-in wallpaper effect. */
 data class RendererEffectDescriptor(
     val id: String,
     val displayName: String,
     val supportsGyro: Boolean,
     val requiresMedia: Boolean,
+    val defaultSpeedPercent: Int = 50,
+    val defaultIntensityPercent: Int = 50,
+    val defaultGyroEnabled: Boolean = false,
+    val defaultInward: Boolean = false,
+    val defaultAnimationEnabled: Boolean = true,
     val defaultParameters: Map<String, Float> = emptyMap(),
     /** Empty until a backend has a real, tested implementation of this effect. */
     val implementedBackends: Set<RendererType> = emptySet()
@@ -15,12 +20,14 @@ data class RendererEffectDescriptor(
     init {
         require(id.isNotBlank())
         require(displayName.isNotBlank())
+        require(defaultSpeedPercent in 0..100)
+        require(defaultIntensityPercent in 0..100)
         require(defaultParameters.keys.all(String::isNotBlank))
         require(defaultParameters.values.all(Float::isFinite))
     }
 }
 
-/** Shared built-in IDs copied from LiveWP. GPU resources and shaders stay backend-specific. */
+/** IDs and settings defaults copied from LiveWP's effect registry and renderer facade. */
 object RendererEffectCatalog {
     const val PULSE_HALO = "pulse_halo"
     const val REACTOR_CORE = "reactor_core"

@@ -2,28 +2,54 @@ package com.livestagix.renderer.pipeline
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
 import android.graphics.Matrix
 import android.graphics.Rect
 import com.livestagix.renderer.api.RendererMedia
 import com.livestagix.renderer.api.RendererMediaAccess
 import com.livestagix.renderer.api.RendererMediaType
 import java.io.IOException
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
+/** Integer source-image rectangle. Kept independent of Android Rect for JVM testing. */
+data class RendererPhotoCropRect(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int
+) {
+    val width: Int get() = right - left
+    val height: Int get() = bottom - top
+
+    init {
+        require(left >= 0 && top >= 0 && right > left && bottom > top)
+    }
+
+    fun toAndroidRect(): Rect = Rect(left, top, right, bottom)
+}
+
 /**
- * Shared CPU photo preparation. Decodes off the render thread, applies host-supplied
- * orientation/crop, and constrains the working bitmap to the selected GPU texture limit.
- * GPU upload and texture lifetime remain the responsibility of each backend.
+ * CPU-side photo preparation shared by every backend.
+ *
+ * Ports LiveWP's region-decode, crop, gyro overscan and bounded working-texture strategy.
+ * It does not create GL/Vulkan resources. The returned bitmap is already oriented; backends
+ * must not apply media.orientationDegrees a second time.
  */
 class RendererPhotoDecoder {
+    @Suppress("DEPRECATION")
     @Throws(IOException::class)
     fun decode(
         media: RendererMedia,
         mediaAccess: RendererMediaAccess,
         targetWidth: Int,
         targetHeight: Int,
-        maxTextureSize: Int
+        maxTextureSize: Int,
+        resolutionFactor: Float = DEFAULT_RESOLUTION_FACTOR,
+        overscanFactor: Float = DEFAULT_OVERSCAN_FACTOR
     ): RendererDecodedPhoto {
         require(media.type != RendererMediaType.VIDEO) {
             "A video cannot be decoded as a photo"
@@ -32,6 +58,8 @@ class RendererPhotoDecoder {
             "Target dimensions must be positive"
         }
         require(maxTextureSize > 0) { "Maximum texture size must be positive" }
+        require(resolutionFactor.isFinite() && resolutionFactor in 0.1f..2f)
+        require(overscanFactor.isFinite() && overscanFactor in 1f..2f)
 
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         mediaAccess.openInputStream(media.uri).use { stream ->
@@ -41,107 +69,258 @@ class RendererPhotoDecoder {
             throw IOException("The selected media is not a decodable image")
         }
 
+        val visibleCrop = calculateVisibleCropRect(
+            sourceWidth = bounds.outWidth,
+            sourceHeight = bounds.outHeight,
+            targetWidth = targetWidth,
+            targetHeight = targetHeight,
+            horizontalOffset = media.crop.horizontal,
+            verticalOffset = media.crop.vertical,
+            orientationDegrees = media.orientationDegrees
+        )
+        val workingCrop = expandPhotoCropRect(
+            visibleCrop,
+            bounds.outWidth,
+            bounds.outHeight,
+            overscanFactor
+        )
+        val overscanScaleX = workingCrop.width / visibleCrop.width.toFloat()
+        val overscanScaleY = workingCrop.height / visibleCrop.height.toFloat()
+        val quarterTurn = media.orientationDegrees == 90 || media.orientationDegrees == 270
+
+        var workingTargetWidth =
+            (if (quarterTurn) targetHeight else targetWidth) * resolutionFactor * overscanScaleX
+        var workingTargetHeight =
+            (if (quarterTurn) targetWidth else targetHeight) * resolutionFactor * overscanScaleY
+        val textureLimitScale = min(
+            1f,
+            maxTextureSize / max(workingTargetWidth, workingTargetHeight)
+        )
+        workingTargetWidth = max(1f, workingTargetWidth * textureLimitScale)
+        workingTargetHeight = max(1f, workingTargetHeight * textureLimitScale)
+
         var sampleSize = 1
         while (
-            max(bounds.outWidth / sampleSize, bounds.outHeight / sampleSize) > maxTextureSize &&
-            sampleSize <= (1 shl 29)
+            sampleSize < (1 shl 20) &&
+            workingCrop.width / (sampleSize * 2f) >= workingTargetWidth * 0.80f &&
+            workingCrop.height / (sampleSize * 2f) >= workingTargetHeight * 0.80f
         ) {
             sampleSize *= 2
         }
 
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = sampleSize
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        val decoded = mediaAccess.openInputStream(media.uri).use { stream ->
-            BitmapFactory.decodeStream(stream, null, options)
-        } ?: throw IOException("Image decoding returned no bitmap")
+        var bitmap: Bitmap? = null
+        var usedRegionDecode = false
+        try {
+            var decoder: BitmapRegionDecoder? = null
+            try {
+                mediaAccess.openInputStream(media.uri).use { input ->
+                    decoder = BitmapRegionDecoder.newInstance(input, false)
+                    val options = BitmapFactory.Options().apply {
+                        inSampleSize = sampleSize
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                    }
+                    bitmap = decoder?.decodeRegion(workingCrop.toAndroidRect(), options)
+                }
+                usedRegionDecode = bitmap != null
+            } catch (_: Exception) {
+                bitmap?.takeUnless { it.isRecycled }?.recycle()
+                bitmap = null
+            } finally {
+                runCatching { decoder?.recycle() }
+            }
 
-        val oriented = try {
-            if (media.orientationDegrees == 0) {
-                decoded
-            } else {
+            if (bitmap == null) {
+                val fallbackOptions = BitmapFactory.Options().apply {
+                    inSampleSize = sampleSize
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+                val full = mediaAccess.openInputStream(media.uri).use { input ->
+                    BitmapFactory.decodeStream(input, null, fallbackOptions)
+                } ?: throw IOException("Image decoding returned no bitmap")
+
+                val safeCrop = scaleCropRect(
+                    workingCrop,
+                    full.width,
+                    full.height,
+                    full.width / bounds.outWidth.toFloat(),
+                    full.height / bounds.outHeight.toFloat()
+                )
+                bitmap = try {
+                    Bitmap.createBitmap(
+                        full,
+                        safeCrop.left,
+                        safeCrop.top,
+                        safeCrop.width,
+                        safeCrop.height
+                    ).also { cropped ->
+                        if (cropped !== full) full.recycle()
+                    }
+                } catch (error: Throwable) {
+                    if (!full.isRecycled) full.recycle()
+                    throw error
+                }
+            }
+
+            val fitted = fitPhotoWorkingTexture(
+                bitmap!!,
+                workingTargetWidth.roundToInt().coerceAtLeast(1),
+                workingTargetHeight.roundToInt().coerceAtLeast(1)
+            )
+            bitmap = fitted
+
+            if (media.orientationDegrees != 0) {
                 val matrix = Matrix().apply {
                     postRotate(media.orientationDegrees.toFloat())
                 }
-                Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
-                    .also { if (it !== decoded) decoded.recycle() }
-            }
-        } catch (error: Throwable) {
-            if (!decoded.isRecycled) decoded.recycle()
-            throw error
-        }
-
-        return try {
-            val crop = calculateCropRect(
-                sourceWidth = oriented.width,
-                sourceHeight = oriented.height,
-                targetWidth = targetWidth,
-                targetHeight = targetHeight,
-                horizontalOffset = media.crop.horizontal,
-                verticalOffset = media.crop.vertical
-            )
-            val cropped = if (
-                crop.left == 0 && crop.top == 0 &&
-                crop.right == oriented.width && crop.bottom == oriented.height
-            ) {
-                oriented
-            } else {
-                Bitmap.createBitmap(
-                    oriented,
-                    crop.left,
-                    crop.top,
-                    crop.width(),
-                    crop.height()
-                ).also { if (it !== oriented) oriented.recycle() }
+                val oriented = Bitmap.createBitmap(
+                    fitted, 0, 0, fitted.width, fitted.height, matrix, true
+                )
+                if (oriented !== fitted) fitted.recycle()
+                bitmap = oriented
             }
 
-            RendererDecodedPhoto(
-                bitmap = cropped,
+            return RendererDecodedPhoto(
+                bitmap = bitmap!!,
                 originalWidth = bounds.outWidth,
                 originalHeight = bounds.outHeight,
-                sampleSize = sampleSize
+                sampleSize = sampleSize,
+                visibleCropWidth = visibleCrop.width,
+                visibleCropHeight = visibleCrop.height,
+                workingCropWidth = workingCrop.width,
+                workingCropHeight = workingCrop.height,
+                overscanScaleX = overscanScaleX,
+                overscanScaleY = overscanScaleY,
+                surfaceWidth = targetWidth,
+                surfaceHeight = targetHeight,
+                usedRegionDecode = usedRegionDecode
             )
         } catch (error: Throwable) {
-            if (!oriented.isRecycled) oriented.recycle()
+            bitmap?.let { if (!it.isRecycled) it.recycle() }
             throw error
         }
     }
 
     companion object {
-        /** Cover crop: -1 aligns to the leading edge, 0 centers, +1 aligns trailing edge. */
-        fun calculateCropRect(
+        const val DEFAULT_OVERSCAN_FACTOR = 1.40f
+        const val DEFAULT_RESOLUTION_FACTOR = 1.15f
+
+        /** Same aspect/crop-coordinate calculation used by LiveWP's sourceCropTexCoords. */
+        fun calculateVisibleCropRect(
             sourceWidth: Int,
             sourceHeight: Int,
             targetWidth: Int,
             targetHeight: Int,
             horizontalOffset: Float = 0f,
-            verticalOffset: Float = 0f
-        ): Rect {
+            verticalOffset: Float = 0f,
+            orientationDegrees: Int = 0
+        ): RendererPhotoCropRect {
             require(sourceWidth > 0 && sourceHeight > 0)
             require(targetWidth > 0 && targetHeight > 0)
             require(horizontalOffset.isFinite() && horizontalOffset in -1f..1f)
             require(verticalOffset.isFinite() && verticalOffset in -1f..1f)
+            require(orientationDegrees in setOf(0, 90, 180, 270))
 
-            val sourceAspect = sourceWidth.toFloat() / sourceHeight
-            val targetAspect = targetWidth.toFloat() / targetHeight
-            var cropWidth = sourceWidth
-            var cropHeight = sourceHeight
-
-            if (sourceAspect > targetAspect) {
-                cropWidth = (sourceHeight * targetAspect).roundToInt().coerceIn(1, sourceWidth)
-            } else {
-                cropHeight = (sourceWidth / targetAspect).roundToInt().coerceIn(1, sourceHeight)
+            val sourceAspect = sourceWidth / sourceHeight.toFloat()
+            var targetAspect = targetWidth / targetHeight.toFloat()
+            if (orientationDegrees == 90 || orientationDegrees == 270) {
+                targetAspect = 1f / targetAspect
             }
 
-            val extraX = sourceWidth - cropWidth
-            val extraY = sourceHeight - cropHeight
-            val left = ((horizontalOffset + 1f) * 0.5f * extraX)
-                .roundToInt().coerceIn(0, extraX)
-            val top = ((verticalOffset + 1f) * 0.5f * extraY)
-                .roundToInt().coerceIn(0, extraY)
+            var u0 = 0f
+            var u1 = 1f
+            var v0 = 0f
+            var v1 = 1f
+            if (sourceAspect > targetAspect) {
+                val visible = targetAspect / sourceAspect
+                val slack = max(0f, 1f - visible)
+                u0 = ((0.5f - horizontalOffset * 0.5f) * slack).coerceIn(0f, slack)
+                u1 = u0 + visible
+            } else if (sourceAspect < targetAspect) {
+                val visible = sourceAspect / targetAspect
+                val slack = max(0f, 1f - visible)
+                v0 = ((0.5f - verticalOffset * 0.5f) * slack).coerceIn(0f, slack)
+                v1 = v0 + visible
+            }
 
-            return Rect(left, top, left + cropWidth, top + cropHeight)
+            val left = floor(u0 * sourceWidth).toInt().coerceIn(0, sourceWidth - 1)
+            val right = ceil(u1 * sourceWidth).toInt().coerceIn(left + 1, sourceWidth)
+            val top = floor((1f - v1) * sourceHeight).toInt().coerceIn(0, sourceHeight - 1)
+            val bottom = ceil((1f - v0) * sourceHeight).toInt().coerceIn(top + 1, sourceHeight)
+            return RendererPhotoCropRect(left, top, right, bottom)
+        }
+
+        fun expandPhotoCropRect(
+            visibleCrop: RendererPhotoCropRect,
+            sourceWidth: Int,
+            sourceHeight: Int,
+            overscanFactor: Float = DEFAULT_OVERSCAN_FACTOR
+        ): RendererPhotoCropRect {
+            require(sourceWidth >= visibleCrop.right && sourceHeight >= visibleCrop.bottom)
+            require(overscanFactor.isFinite() && overscanFactor >= 1f)
+
+            val centerX = (visibleCrop.left + visibleCrop.right) * 0.5f
+            val centerY = (visibleCrop.top + visibleCrop.bottom) * 0.5f
+            val visibleWidth = visibleCrop.width
+            val visibleHeight = visibleCrop.height
+            val scaleX = min(
+                overscanFactor,
+                min(2f * centerX / visibleWidth, 2f * (sourceWidth - centerX) / visibleWidth)
+            ).coerceAtLeast(1f)
+            val scaleY = min(
+                overscanFactor,
+                min(2f * centerY / visibleHeight, 2f * (sourceHeight - centerY) / visibleHeight)
+            ).coerceAtLeast(1f)
+
+            val expandedWidth = max(
+                visibleWidth,
+                min(sourceWidth, (visibleWidth * scaleX).roundToInt())
+            )
+            val expandedHeight = max(
+                visibleHeight,
+                min(sourceHeight, (visibleHeight * scaleY).roundToInt())
+            )
+            val left = (centerX - expandedWidth * 0.5f).roundToInt()
+                .coerceIn(0, sourceWidth - expandedWidth)
+            val top = (centerY - expandedHeight * 0.5f).roundToInt()
+                .coerceIn(0, sourceHeight - expandedHeight)
+            return RendererPhotoCropRect(left, top, left + expandedWidth, top + expandedHeight)
+        }
+
+        private fun scaleCropRect(
+            source: RendererPhotoCropRect,
+            targetWidth: Int,
+            targetHeight: Int,
+            scaleX: Float,
+            scaleY: Float
+        ): RendererPhotoCropRect {
+            val left = floor(source.left * scaleX).toInt().coerceIn(0, targetWidth - 1)
+            val top = floor(source.top * scaleY).toInt().coerceIn(0, targetHeight - 1)
+            val right = ceil(source.right * scaleX).toInt().coerceIn(left + 1, targetWidth)
+            val bottom = ceil(source.bottom * scaleY).toInt().coerceIn(top + 1, targetHeight)
+            return RendererPhotoCropRect(left, top, right, bottom)
+        }
+
+        private fun fitPhotoWorkingTexture(
+            bitmap: Bitmap,
+            targetWidth: Int,
+            targetHeight: Int
+        ): Bitmap {
+            val scale = min(
+                1f,
+                min(
+                    targetWidth / bitmap.width.toFloat(),
+                    targetHeight / bitmap.height.toFloat()
+                )
+            )
+            if (scale >= 0.9999f) return bitmap
+            val scaled = Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).roundToInt().coerceAtLeast(1),
+                (bitmap.height * scale).roundToInt().coerceAtLeast(1),
+                true
+            )
+            if (scaled !== bitmap) bitmap.recycle()
+            return scaled
         }
     }
 }
@@ -150,7 +329,16 @@ data class RendererDecodedPhoto(
     val bitmap: Bitmap,
     val originalWidth: Int,
     val originalHeight: Int,
-    val sampleSize: Int
+    val sampleSize: Int,
+    val visibleCropWidth: Int,
+    val visibleCropHeight: Int,
+    val workingCropWidth: Int,
+    val workingCropHeight: Int,
+    val overscanScaleX: Float,
+    val overscanScaleY: Float,
+    val surfaceWidth: Int,
+    val surfaceHeight: Int,
+    val usedRegionDecode: Boolean
 ) : AutoCloseable {
     override fun close() {
         if (!bitmap.isRecycled) bitmap.recycle()
