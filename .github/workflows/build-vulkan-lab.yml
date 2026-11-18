@@ -88,7 +88,7 @@ jobs:
           VULKAN_LAB_KEYSTORE_PASSWORD: ${{ secrets.VULKAN_LAB_KEYSTORE_PASSWORD }}
           VULKAN_LAB_KEY_ALIAS: ${{ secrets.VULKAN_LAB_KEY_ALIAS }}
           VULKAN_LAB_KEY_PASSWORD: ${{ secrets.VULKAN_LAB_KEY_PASSWORD }}
-        run: gradle --no-daemon assembleDebug assembleRelease bundleRelease :macrobenchmark:assemble
+        run: gradle --no-daemon :renderer:testDebugUnitTest assembleDebug assembleRelease bundleRelease :macrobenchmark:assemble
 
       - name: Verify APK, AAB and R8 outputs
         run: |

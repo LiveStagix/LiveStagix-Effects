@@ -2,19 +2,12 @@ package com.livestagix.renderer.api
 
 import android.net.Uri
 
-/** How a media URI should be decoded when its content type is not self-evident. */
 enum class RendererMediaType {
     AUTO,
     PHOTO,
     VIDEO
 }
 
-/**
- * Normalized crop offsets for a media source.
- *
- * Both values use the existing LiveWP convention: -1 moves toward the leading edge,
- * +1 moves toward the trailing edge, and 0 keeps the crop centered.
- */
 data class RendererCropPosition(
     val horizontal: Float = 0f,
     val vertical: Float = 0f
@@ -29,7 +22,6 @@ data class RendererCropPosition(
     }
 }
 
-/** A photo or video input shared by all rendering backends. */
 data class RendererMedia(
     val uri: Uri,
     val type: RendererMediaType = RendererMediaType.AUTO,
@@ -46,12 +38,6 @@ data class RendererMedia(
     }
 }
 
-/**
- * Backend-neutral effect description.
- *
- * Parameters are effect-specific scalar values. Backends may report an unsupported
- * effect or parameter through their normal renderer failure/diagnostic mechanisms.
- */
 data class RendererEffect(
     val id: String,
     val speedPercent: Int = 50,
@@ -72,20 +58,23 @@ data class RendererEffect(
             "Effect parameter values must be finite"
         }
     }
+
+    fun snapshot(): RendererEffect = copy(parameters = parameters.toMap())
 }
 
-/**
- * Describes the complete desired wallpaper scene.
- *
- * Media, a standalone effect, and overlay effects can coexist so a backend can support
- * media-backed scenes as well as standalone animated wallpapers. A null media/effect
- * represents an intentionally empty scene.
- */
+/** Complete desired wallpaper scene; media and effects may coexist. */
 data class RendererScene(
     val media: RendererMedia? = null,
     val standaloneEffect: RendererEffect? = null,
     val overlayEffects: List<RendererEffect> = emptyList()
 ) {
+    /** Creates a defensive snapshot for asynchronous backend queues. */
+    fun snapshot(): RendererScene = copy(
+        media = media?.copy(crop = media.crop.copy()),
+        standaloneEffect = standaloneEffect?.snapshot(),
+        overlayEffects = overlayEffects.map { it.snapshot() }
+    )
+
     companion object {
         val EMPTY = RendererScene()
     }

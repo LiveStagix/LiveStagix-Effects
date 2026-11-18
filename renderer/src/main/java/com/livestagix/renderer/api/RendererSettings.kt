@@ -1,6 +1,5 @@
 package com.livestagix.renderer.api
 
-/** Smart Upscale implementation preference retained from the LiveWP renderer. */
 enum class RendererUpscaleBackendPreference {
     AUTO,
     SA,
@@ -9,11 +8,18 @@ enum class RendererUpscaleBackendPreference {
     LS
 }
 
+/** Algorithm decision reported by the shared Smart Upscale policy. */
+enum class RendererUpscaleAlgorithm {
+    NONE,
+    SPATIAL_ADAPTIVE,
+    RCAS_SHARPEN,
+    GENERIC_ENHANCE,
+    LINEAR
+}
+
 /**
  * Rendering preferences shared by Vulkan, OpenGL ES 3.0, and OpenGL ES 2.0.
- *
- * These are requested settings, not promises that every backend or device supports
- * every feature. Backend capability checks and runtime fallback remain authoritative.
+ * These are requested settings, not promises that every backend supports each feature.
  */
 data class RendererSettings(
     val targetFps: Int = 60,

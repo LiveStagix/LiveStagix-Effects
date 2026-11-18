@@ -61,5 +61,19 @@
                 android:name="android.service.wallpaper"
                 android:resource="@xml/gles3_wallpaper" />
         </service>
+
+        <service
+            android:name=".Gles2WallpaperService"
+            android:process=":gles2_wallpaper_engine"
+            android:exported="true"
+            android:label="@string/gles2_wallpaper_name"
+            android:permission="android.permission.BIND_WALLPAPER">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/gles2_wallpaper" />
+        </service>
     </application>
 </manifest>

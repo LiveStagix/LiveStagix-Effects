@@ -116,6 +116,20 @@ class MainActivity : Activity() {
             dp(52)
         ))
 
+        val gles2PreviewButton = Button(this).apply {
+            text = "Test GLES 2.0"
+            setOnClickListener {
+                openWallpaperPreview(
+                    ComponentName(this@MainActivity, Gles2WallpaperService::class.java),
+                    "GLES 2.0"
+                )
+            }
+        }
+        root.addView(gles2PreviewButton, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            dp(48)
+        ))
+
         val logHeader = TextView(this).apply {
             text = "EVENT RECORDER"
             textSize = 12f

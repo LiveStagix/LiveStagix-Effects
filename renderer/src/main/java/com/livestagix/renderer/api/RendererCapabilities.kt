@@ -3,8 +3,9 @@ package com.livestagix.renderer.api
 /**
  * Structured capabilities reported by a backend after device inspection.
  *
- * Nullable identity/version fields mean that the backend has not exposed that
- * information yet. Extension names remain backend-specific diagnostic data.
+ * features contains low-level GPU/API capabilities. contentFeatures contains high-level
+ * renderer features that are actually implemented end-to-end by this backend.
+ * Empty contentFeatures means no media/effect feature has been verified yet.
  */
 data class RendererCapabilities(
     val backendType: RendererType,
@@ -13,5 +14,6 @@ data class RendererCapabilities(
     val driverVersion: String? = null,
     val extensions: Set<String> = emptySet(),
     val features: Set<RendererFeature> = emptySet(),
-    val maxTextureSize: Int? = null
+    val maxTextureSize: Int? = null,
+    val contentFeatures: Set<RendererContentFeature> = emptySet()
 )
