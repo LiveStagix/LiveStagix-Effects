@@ -22,8 +22,8 @@ class RendererManagerContentSessionTest {
         assertEquals(2, delegate.sceneUpdates)
         assertSame(RendererMotion.NEUTRAL, delegate.motion)
         assertSame(RendererSettings.DEFAULT, delegate.settings)
-        assertEquals(true, delegate.paused)
-        assertSame(listener, delegate.eventListener)
+        assertEquals(true, delegate.pausedState)
+        assertSame(listener, delegate.listenerState)
     }
 
     @Test
@@ -48,13 +48,13 @@ class RendererManagerContentSessionTest {
         var sceneUpdates = 0
         var motion: RendererMotion? = null
         var settings: RendererSettings? = null
-        var paused = false
-        var eventListener: RendererEventListener? = null
+        var pausedState = false
+        var listenerState: RendererEventListener? = null
         var closeCount = 0
 
         override fun resize(width: Int, height: Int) = Unit
         override fun setPaused(paused: Boolean) {
-            this.paused = paused
+            this.pausedState = paused
         }
         override fun setFailureListener(listener: RendererFailureListener?) = Unit
         override fun setScene(scene: RendererScene) {
@@ -76,7 +76,7 @@ class RendererManagerContentSessionTest {
             this.paused = paused
         }
         override fun setEventListener(listener: RendererEventListener?) {
-            eventListener = listener
+            listenerState = listener
         }
         override fun close() {
             closeCount++
