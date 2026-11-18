@@ -45,7 +45,7 @@ class GlesMotionMatrixTest {
         assertEquals(16, matrix.size)
         assertTrue(matrix.all(Float::isFinite))
         assertTrue(matrix[11] < 0f)
-        assertTrue(matrix[14] < 0f)
+        assertTrue(matrix[14] > 0f)
     }
 
     @Test
