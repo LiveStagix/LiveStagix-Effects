@@ -94,7 +94,8 @@ class RendererCoreFoundationTest {
             1080,
             2400
         )
-        assertTrue(first.translationX > 0f)
+        // LiveWP snaps sub-pixel movement below 0.2px to zero on the first short frame.
+        assertEquals(0f, first.translationX, 0.001f)
         assertTrue(second.translationX > first.translationX)
         assertTrue(second.translationX - first.translationX <= 5f)
 
