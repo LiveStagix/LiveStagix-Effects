@@ -819,8 +819,8 @@ class Gles3RendererBackend : RendererBackend {
             )
 
             private val TEST_TEXTURE_PIXELS = byteArrayOf(
-                0x16, 0x45, 0x86, 0xFF.toByte(),
-                0x58, 0x8B, 0xC7.toByte(), 0xFF.toByte(),
+                0x16, 0x45, 0x86.toByte(), 0xFF.toByte(),
+                0x58, 0x8B.toByte(), 0xC7.toByte(), 0xFF.toByte(),
                 0x70, 0x42, 0x9B.toByte(), 0xFF.toByte(),
                 0x27, 0x72, 0xA2.toByte(), 0xFF.toByte()
             )
