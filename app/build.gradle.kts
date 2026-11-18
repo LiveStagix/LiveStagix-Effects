@@ -2,6 +2,7 @@ import java.io.File
 
 plugins {
     id("com.android.application")
+    id("androidx.baselineprofile")
 }
 
 val buildNumber = providers.environmentVariable("GITHUB_RUN_NUMBER")
@@ -81,4 +82,6 @@ android {
 
 dependencies {
     implementation(project(":renderer"))
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
+    baselineProfile(project(":macrobenchmark"))
 }
