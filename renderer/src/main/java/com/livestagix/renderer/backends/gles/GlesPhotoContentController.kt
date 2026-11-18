@@ -1,6 +1,7 @@
 package com.livestagix.renderer.backends.gles
 
 import android.graphics.Bitmap
+import android.net.Uri
 import com.livestagix.renderer.api.RendererEvent
 import com.livestagix.renderer.api.RendererFailure
 import com.livestagix.renderer.api.RendererFailureCategory
@@ -28,11 +29,15 @@ internal class GlesPhotoContentController(
     private val dispatchMediaReleased: (RendererMedia, RendererMediaReleaseListener?) -> Unit,
     private val log: (String, String) -> Unit
 ) : AutoCloseable {
+    private data class PendingMediaRelease(
+        val media: RendererMedia,
+        val listener: RendererMediaReleaseListener?
+    )
+
     private val decoder = RendererPhotoDecoder()
     private val decodeLock = Any()
-    private val inFlightDecodes = mutableMapOf<RendererMedia, Int>()
-    private val pendingReleases =
-        mutableMapOf<RendererMedia, MutableList<RendererMediaReleaseListener?>>()
+    private val inFlightDecodes = mutableMapOf<Uri, Int>()
+    private val pendingReleases = mutableMapOf<Uri, MutableList<PendingMediaRelease>>()
 
     private var scene = RendererScene.EMPTY
     private var surfaceWidth = 0
@@ -93,6 +98,7 @@ internal class GlesPhotoContentController(
         if (nextScene == scene) return
 
         val previousMedia = scene.media
+        nextMedia?.let { cancelPendingRelease(it.uri) }
         scene = nextScene
         decodeGeneration++
 
@@ -102,7 +108,7 @@ internal class GlesPhotoContentController(
             photoOverscanScaleX = 1f
             photoOverscanScaleY = 1f
             deleteTexture(previousTexture)
-            if (previousMedia != null) {
+            if (previousMedia != null && previousMedia.uri != nextMedia?.uri) {
                 releaseMediaWhenSafe(previousMedia, previousMediaReleased)
             }
         }
@@ -121,7 +127,7 @@ internal class GlesPhotoContentController(
 
         val generation = ++decodeGeneration
         synchronized(decodeLock) {
-            inFlightDecodes[media] = (inFlightDecodes[media] ?: 0) + 1
+            inFlightDecodes[media.uri] = (inFlightDecodes[media.uri] ?: 0) + 1
         }
 
         val worker = Thread({
@@ -138,7 +144,7 @@ internal class GlesPhotoContentController(
             } catch (error: Throwable) {
                 decodeFailure = error
             } finally {
-                finishDecode(media)
+                finishDecode(media.uri)
             }
 
             val result = decoded
@@ -188,18 +194,20 @@ internal class GlesPhotoContentController(
         worker.start()
     }
 
-    private fun finishDecode(media: RendererMedia) {
+    private fun finishDecode(uri: Uri) {
         val releases = synchronized(decodeLock) {
-            val remaining = (inFlightDecodes[media] ?: 1) - 1
+            val remaining = (inFlightDecodes[uri] ?: 1) - 1
             if (remaining <= 0) {
-                inFlightDecodes.remove(media)
-                pendingReleases.remove(media)
+                inFlightDecodes.remove(uri)
+                pendingReleases.remove(uri)
             } else {
-                inFlightDecodes[media] = remaining
+                inFlightDecodes[uri] = remaining
                 null
             }
         }
-        releases?.forEach { listener -> dispatchMediaReleased(media, listener) }
+        releases?.forEach { pending ->
+            dispatchMediaReleased(pending.media, pending.listener)
+        }
     }
 
     private fun releaseMediaWhenSafe(
@@ -207,14 +215,22 @@ internal class GlesPhotoContentController(
         listener: RendererMediaReleaseListener?
     ) {
         val releaseNow = synchronized(decodeLock) {
-            if ((inFlightDecodes[media] ?: 0) > 0) {
-                pendingReleases.getOrPut(media) { mutableListOf() }.add(listener)
+            if ((inFlightDecodes[media.uri] ?: 0) > 0) {
+                pendingReleases.getOrPut(media.uri) { mutableListOf() }
+                    .add(PendingMediaRelease(media, listener))
                 false
             } else {
                 true
             }
         }
         if (releaseNow) dispatchMediaReleased(media, listener)
+    }
+
+    /** A source selected again must not be released by an earlier scene transition. */
+    private fun cancelPendingRelease(uri: Uri) {
+        synchronized(decodeLock) {
+            pendingReleases.remove(uri)
+        }
     }
 
     private fun reportFailure(
