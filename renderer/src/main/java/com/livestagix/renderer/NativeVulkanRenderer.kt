@@ -73,7 +73,7 @@ object NativeVulkanRenderer {
         val failure = RendererFailure(
             category = category,
             message = message,
-            diagnosticCode = diagnosticCode.ifBlank { null }
+            diagnosticCode = diagnosticCode.takeIf { it.isNotBlank() }
         )
 
         val listener = synchronized(failureLock) {

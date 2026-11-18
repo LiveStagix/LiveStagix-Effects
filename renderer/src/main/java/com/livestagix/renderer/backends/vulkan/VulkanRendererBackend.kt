@@ -63,7 +63,7 @@ class VulkanRendererBackend : RendererBackend {
                     RendererSupportResult.Unsupported(
                         RendererFailure(
                             category = category,
-                            diagnosticCode = result[2].ifBlank { null },
+                            diagnosticCode = result[2].takeIf { it.isNotBlank() },
                             message = result[3]
                         )
                     )
