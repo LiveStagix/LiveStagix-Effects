@@ -49,6 +49,21 @@ class GlesMotionMatrixTest {
     }
 
     @Test
+    fun photoOverscanIsCompensatedIndependentlyOnEachAxis() {
+        val matrix = GlesMotionMatrix.build(
+            RendererMotionTransform.IDENTITY,
+            viewportWidth = 100,
+            viewportHeight = 200,
+            threeDimensional = false,
+            baseScaleX = 1.4f,
+            baseScaleY = 1.2f
+        )
+
+        assertEquals(1.4f, matrix[0], 0.0001f)
+        assertEquals(1.2f, matrix[5], 0.0001f)
+    }
+
+    @Test
     fun neutralTwoDimensionalTransformIsIdentity() {
         val matrix = GlesMotionMatrix.build(
             RendererMotionTransform.IDENTITY,

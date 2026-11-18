@@ -17,8 +17,12 @@ internal object GlesMotionMatrix {
         transform: RendererMotionTransform,
         viewportWidth: Int,
         viewportHeight: Int,
-        threeDimensional: Boolean
+        threeDimensional: Boolean,
+        baseScaleX: Float = 1f,
+        baseScaleY: Float = 1f
     ): FloatArray {
+        require(baseScaleX.isFinite() && baseScaleX >= 1f)
+        require(baseScaleY.isFinite() && baseScaleY >= 1f)
         val width = viewportWidth.coerceAtLeast(1).toFloat()
         val height = viewportHeight.coerceAtLeast(1).toFloat()
         val aspect = width / height
@@ -34,7 +38,14 @@ internal object GlesMotionMatrix {
             model = multiply(model, rotationX(transform.rotationXDegrees))
             model = multiply(model, rotationY(transform.rotationYDegrees))
             model = multiply(model, rotationZ(transform.rotationZDegrees))
-            model = multiply(model, scale(aspect * transform.scale, transform.scale, 1f))
+            model = multiply(
+                model,
+                scale(
+                    aspect * transform.scale * baseScaleX,
+                    transform.scale * baseScaleY,
+                    1f
+                )
+            )
             return multiply(projection, model)
         }
 
@@ -48,7 +59,10 @@ internal object GlesMotionMatrix {
             )
         )
         result = multiply(result, rotationZ(transform.rotationZDegrees))
-        result = multiply(result, scale(transform.scale, transform.scale, 1f))
+        result = multiply(
+            result,
+            scale(transform.scale * baseScaleX, transform.scale * baseScaleY, 1f)
+        )
         return result
     }
 

@@ -38,11 +38,19 @@ internal class GlesPhotoContentController(
     private var surfaceWidth = 0
     private var surfaceHeight = 0
     private var photoTexture = 0
+    private var photoOverscanScaleX = 1f
+    private var photoOverscanScaleY = 1f
     private var decodeGeneration = 0L
     private var closed = false
 
     val textureId: Int
         get() = photoTexture
+
+    val overscanScaleX: Float
+        get() = photoOverscanScaleX
+
+    val overscanScaleY: Float
+        get() = photoOverscanScaleY
 
     val currentMedia: RendererMedia?
         get() = scene.media
@@ -91,6 +99,8 @@ internal class GlesPhotoContentController(
         if (previousMedia != nextMedia) {
             val previousTexture = photoTexture
             photoTexture = 0
+            photoOverscanScaleX = 1f
+            photoOverscanScaleY = 1f
             deleteTexture(previousTexture)
             if (previousMedia != null) {
                 releaseMediaWhenSafe(previousMedia, previousMediaReleased)
@@ -151,6 +161,8 @@ internal class GlesPhotoContentController(
                         check(replacement != 0) { "Photo texture upload returned texture 0" }
                         val previousTexture = photoTexture
                         photoTexture = replacement
+                        photoOverscanScaleX = result.overscanScaleX.coerceAtLeast(1f)
+                        photoOverscanScaleY = result.overscanScaleY.coerceAtLeast(1f)
                         deleteTexture(previousTexture)
                         log(
                             "INFO",
@@ -227,6 +239,8 @@ internal class GlesPhotoContentController(
         decodeGeneration++
         val previousTexture = photoTexture
         photoTexture = 0
+        photoOverscanScaleX = 1f
+        photoOverscanScaleY = 1f
         deleteTexture(previousTexture)
         scene = RendererScene.EMPTY
     }

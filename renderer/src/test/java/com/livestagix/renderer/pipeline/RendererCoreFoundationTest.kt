@@ -41,6 +41,22 @@ class RendererCoreFoundationTest {
     }
 
     @Test
+    fun photoOverscanScalesFollowPhysicallyOrientedBitmapAxes() {
+        assertEquals(
+            1.2f to 1.4f,
+            RendererPhotoDecoder.orientOverscanScales(1.4f, 1.2f, 90)
+        )
+        assertEquals(
+            1.4f to 1.2f,
+            RendererPhotoDecoder.orientOverscanScales(1.4f, 1.2f, 0)
+        )
+        assertEquals(
+            1.2f to 1.4f,
+            RendererPhotoDecoder.orientOverscanScales(1.4f, 1.2f, 270)
+        )
+    }
+
+    @Test
     fun motionCalculatorPreservesLiveWpSensitivityAndEdgeSafety() {
         val motion = RendererMotion(
             rollDegrees = 18f,

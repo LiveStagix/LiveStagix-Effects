@@ -179,6 +179,11 @@ class RendererPhotoDecoder {
                 bitmap = oriented
             }
 
+            // The returned bitmap is physically rotated. Keep overscan scales aligned
+            // with its output X/Y axes so GLES plane compensation matches the oriented image.
+            val (outputOverscanScaleX, outputOverscanScaleY) =
+                orientOverscanScales(overscanScaleX, overscanScaleY, media.orientationDegrees)
+
             return RendererDecodedPhoto(
                 bitmap = bitmap!!,
                 originalWidth = bounds.outWidth,
@@ -188,8 +193,8 @@ class RendererPhotoDecoder {
                 visibleCropHeight = visibleCrop.height,
                 workingCropWidth = workingCrop.width,
                 workingCropHeight = workingCrop.height,
-                overscanScaleX = overscanScaleX,
-                overscanScaleY = overscanScaleY,
+                overscanScaleX = outputOverscanScaleX,
+                overscanScaleY = outputOverscanScaleY,
                 surfaceWidth = targetWidth,
                 surfaceHeight = targetHeight,
                 usedRegionDecode = usedRegionDecode
@@ -203,6 +208,22 @@ class RendererPhotoDecoder {
     companion object {
         const val DEFAULT_OVERSCAN_FACTOR = 1.40f
         const val DEFAULT_RESOLUTION_FACTOR = 1.15f
+
+        /** Remaps source-axis overscan to the output axes after physical photo orientation. */
+        internal fun orientOverscanScales(
+            sourceScaleX: Float,
+            sourceScaleY: Float,
+            orientationDegrees: Int
+        ): Pair<Float, Float> {
+            require(sourceScaleX.isFinite() && sourceScaleX >= 1f)
+            require(sourceScaleY.isFinite() && sourceScaleY >= 1f)
+            require(orientationDegrees in setOf(0, 90, 180, 270))
+            return if (orientationDegrees == 90 || orientationDegrees == 270) {
+                sourceScaleY to sourceScaleX
+            } else {
+                sourceScaleX to sourceScaleY
+            }
+        }
 
         /** Same aspect/crop-coordinate calculation used by LiveWP's sourceCropTexCoords. */
         fun calculateVisibleCropRect(

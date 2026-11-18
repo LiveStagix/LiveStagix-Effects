@@ -672,7 +672,9 @@ class Gles2RendererBackend : RendererBackend {
                     transform,
                     width,
                     height,
-                    motion.configuration.threeDimensionalEnabled
+                    motion.configuration.threeDimensionalEnabled,
+                    baseScaleX = contentController?.overscanScaleX ?: 1f,
+                    baseScaleY = contentController?.overscanScaleY ?: 1f
                 )
 
                 GLES20.glUseProgram(program)
