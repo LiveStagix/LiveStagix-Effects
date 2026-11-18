@@ -73,7 +73,7 @@ class RendererManagerContentSessionTest {
             this.settings = settings
         }
         override fun setPlaybackPaused(paused: Boolean) {
-            this.paused = paused
+            this.pausedState = paused
         }
         override fun setEventListener(listener: RendererEventListener?) {
             listenerState = listener
