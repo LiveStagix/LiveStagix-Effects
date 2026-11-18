@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LiveStagix Vulkan Mock</string>
+    <string name="app_name">LiveStagix Renderer Lab</string>
     <string name="wallpaper_name">LiveStagix Vulkan Test</string>
     <string name="wallpaper_description">A test wallpaper using the LiveStagix Vulkan renderer.</string>
+    <string name="gles3_wallpaper_name">LiveStagix OpenGL ES 3.0 Test</string>
+    <string name="gles3_wallpaper_description">A test wallpaper using the independent LiveStagix OpenGL ES 3.0 renderer.</string>
 </resources>

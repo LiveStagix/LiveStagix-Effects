@@ -48,7 +48,7 @@ class MainActivity : Activity() {
 
         EventRecorder.setListener { refreshLogs() }
         refreshLogs()
-        statusLabel.text = "Ready — preview the Vulkan live wallpaper"
+        statusLabel.text = "Ready — choose a renderer to test"
     }
 
     private fun buildScreen() {
@@ -59,7 +59,7 @@ class MainActivity : Activity() {
         }
 
         val title = TextView(this).apply {
-            text = "LIVESTAGIX VULKAN MOCK"
+            text = "LIVESTAGIX RENDERER LAB"
             textSize = 18f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER_VERTICAL
@@ -80,11 +80,38 @@ class MainActivity : Activity() {
             dp(34)
         ))
 
-        val previewButton = Button(this).apply {
-            text = "Set as Live Wallpaper"
-            setOnClickListener { openWallpaperPreview() }
+        val previewButtons = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
         }
-        root.addView(previewButton, LinearLayout.LayoutParams(
+
+        val vulkanPreviewButton = Button(this).apply {
+            text = "Test Vulkan"
+            setOnClickListener {
+                openWallpaperPreview(
+                    ComponentName(this@MainActivity, VulkanWallpaperService::class.java),
+                    "Vulkan"
+                )
+            }
+        }
+        val gles3PreviewButton = Button(this).apply {
+            text = "Test GLES 3.0"
+            setOnClickListener {
+                openWallpaperPreview(
+                    ComponentName(this@MainActivity, Gles3WallpaperService::class.java),
+                    "GLES 3.0"
+                )
+            }
+        }
+        previewButtons.addView(
+            vulkanPreviewButton,
+            LinearLayout.LayoutParams(0, dp(52), 1f)
+        )
+        previewButtons.addView(
+            gles3PreviewButton,
+            LinearLayout.LayoutParams(0, dp(52), 1f)
+        )
+        root.addView(previewButtons, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
             dp(52)
         ))
@@ -146,23 +173,23 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun openWallpaperPreview() {
-        val service = ComponentName(this, VulkanWallpaperService::class.java)
+    private fun openWallpaperPreview(service: ComponentName, backendName: String) {
         val setupIntent = Intent(WallpaperManager.ACTION_CHANGE_LIVE_WALLPAPER).apply {
             putExtra(WallpaperManager.EXTRA_LIVE_WALLPAPER_COMPONENT, service)
         }
 
-        armWallpaperReturnVerification()
-        statusLabel.text = "Opening Android wallpaper setup..."
+        armWallpaperReturnVerification(service)
+        statusLabel.text = "Opening Android wallpaper setup ($backendName)..."
         EventRecorder.record(
             "INFO",
             "APP",
-            "Launching Android live-wallpaper setup; component=${service.flattenToShortString()}"
+            "Launching $backendName live-wallpaper setup; " +
+                "component=${service.flattenToShortString()}"
         )
 
         runCatching {
             startActivity(setupIntent)
-        }.onFailure {
+        }.onFailure { error ->
             wallpaperSetupPreferences().edit()
                 .putBoolean(PREF_RETURN_VERIFY_ARMED, false)
                 .putBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
@@ -172,7 +199,7 @@ class MainActivity : Activity() {
             EventRecorder.record(
                 "ERROR",
                 "APP",
-                "Could not open Android wallpaper setup: ${it.message}"
+                "Could not open $backendName wallpaper setup: ${error.message}"
             )
             Toast.makeText(this, "Could not open wallpaper setup", Toast.LENGTH_SHORT).show()
         }
@@ -181,8 +208,9 @@ class MainActivity : Activity() {
     private fun wallpaperSetupPreferences() =
         getSharedPreferences(PREF_WALLPAPER_SETUP, MODE_PRIVATE)
 
-    private fun armWallpaperReturnVerification() {
+    private fun armWallpaperReturnVerification(service: ComponentName) {
         wallpaperSetupPreferences().edit()
+            .putString(PREF_EXPECTED_WALLPAPER_COMPONENT, service.flattenToString())
             .putBoolean(PREF_RETURN_VERIFY_ARMED, true)
             .putBoolean(PREF_RETURN_VERIFY_BACKGROUND, false)
             .putString(PREF_RETURN_VERIFY_STATE, "armed")
@@ -225,7 +253,9 @@ class MainActivity : Activity() {
         val verification = Runnable {
             try {
                 val manager = WallpaperManager.getInstance(this)
-                val expected = ComponentName(this, VulkanWallpaperService::class.java)
+                val expected = ComponentName.unflattenFromString(
+                    prefs.getString(PREF_EXPECTED_WALLPAPER_COMPONENT, "").orEmpty()
+                ) ?: ComponentName(this, VulkanWallpaperService::class.java)
                 val home = manager.getWallpaperInfo(WallpaperManager.FLAG_SYSTEM)
                 val lock = manager.getWallpaperInfo(WallpaperManager.FLAG_LOCK)
                 val ownsHome = home?.component == expected
@@ -311,7 +341,7 @@ class MainActivity : Activity() {
     private fun copyLogs() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(
-            ClipData.newPlainText("LiveStagix Vulkan session log", EventRecorder.snapshot())
+            ClipData.newPlainText("LiveStagix renderer session log", EventRecorder.snapshot())
         )
         Toast.makeText(this, "Session log copied", Toast.LENGTH_SHORT).show()
     }
@@ -349,6 +379,7 @@ class MainActivity : Activity() {
 
     companion object {
         private const val PREF_WALLPAPER_SETUP = "vulkan_wallpaper_setup"
+        private const val PREF_EXPECTED_WALLPAPER_COMPONENT = "wallpaper_return_verification_component"
         private const val PREF_RETURN_VERIFY_ARMED = "wallpaper_return_verification_armed"
         private const val PREF_RETURN_VERIFY_BACKGROUND = "wallpaper_return_verification_backgrounded"
         private const val PREF_RETURN_VERIFY_STATE = "wallpaper_return_verification_state"

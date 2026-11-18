@@ -10,6 +10,9 @@
     <uses-feature
         android:name="android.software.live_wallpaper"
         android:required="false" />
+    <uses-feature
+        android:glEsVersion="0x00030000"
+        android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -43,6 +46,20 @@
             <meta-data
                 android:name="android.service.wallpaper"
                 android:resource="@xml/vulkan_wallpaper" />
+        </service>
+
+        <service
+            android:name=".Gles3WallpaperService"
+            android:process=":gles3_wallpaper_engine"
+            android:exported="true"
+            android:label="@string/gles3_wallpaper_name"
+            android:permission="android.permission.BIND_WALLPAPER">
+            <intent-filter>
+                <action android:name="android.service.wallpaper.WallpaperService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.service.wallpaper"
+                android:resource="@xml/gles3_wallpaper" />
         </service>
     </application>
 </manifest>
