@@ -12,6 +12,7 @@ import com.livestagix.renderer.api.RendererFailureListener
 import com.livestagix.renderer.api.RendererFeature
 import com.livestagix.renderer.api.RendererLogListener
 import com.livestagix.renderer.api.RendererSession
+import com.livestagix.renderer.api.RendererSupportResult
 import com.livestagix.renderer.api.RendererType
 
 /** Adapts the existing native Vulkan renderer to the backend-neutral API. */
