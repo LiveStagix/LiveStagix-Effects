@@ -12,18 +12,28 @@ import android.os.Looper
 import android.view.Surface
 import com.livestagix.renderer.api.RendererBackend
 import com.livestagix.renderer.api.RendererCapabilities
+import com.livestagix.renderer.api.RendererContentFeature
+import com.livestagix.renderer.api.RendererContentSession
 import com.livestagix.renderer.api.RendererCreateRequest
+import com.livestagix.renderer.api.RendererEvent
+import com.livestagix.renderer.api.RendererEventListener
+import com.livestagix.renderer.api.RendererMediaAccess
+import com.livestagix.renderer.api.RendererMediaReleaseListener
+import com.livestagix.renderer.api.RendererMotion
+import com.livestagix.renderer.api.RendererScene
+import com.livestagix.renderer.api.RendererSettings
+import com.livestagix.renderer.pipeline.RendererMotionTransformSmoother
 import com.livestagix.renderer.api.RendererException
 import com.livestagix.renderer.api.RendererFailure
 import com.livestagix.renderer.api.RendererFailureCategory
 import com.livestagix.renderer.api.RendererFailureListener
 import com.livestagix.renderer.api.RendererFeature
 import com.livestagix.renderer.api.RendererLogListener
-import com.livestagix.renderer.api.RendererSession
 import com.livestagix.renderer.api.RendererSupportResult
 import com.livestagix.renderer.api.RendererType
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
@@ -32,9 +42,8 @@ import java.util.concurrent.locks.LockSupport
  * Independent OpenGL ES 3.0 backend.
  *
  * This first migration slice ports the LiveWP Modern path's EGL ES3 context,
- * GLSL ES 3.00 2D sampling shaders, reusable quad geometry and texture-backed
- * presentation. Photo decoding, video import, motion, effects and post-processing
- * are intentionally added through the shared renderer contracts in later slices.
+ * GLSL ES 3.00 photo sampling, shared CPU photo preparation and motion transforms.
+ * Video, effects, frame generation and Smart Upscale remain separate implementation stages.
  *
  * ES2 is never requested as a fallback from this backend.
  */
@@ -84,6 +93,7 @@ class Gles3RendererBackend : RendererBackend {
 
         val renderThread = Gles3RenderThread(
             surface = request.surface,
+            mediaAccess = request.mediaAccess,
             initiallyPaused = request.config.initiallyPaused,
             log = ::log
         )
@@ -196,7 +206,7 @@ class Gles3RendererBackend : RendererBackend {
     private class Gles3RendererSession(
         private val renderThread: Gles3RenderThread,
         override val capabilities: RendererCapabilities
-    ) : RendererSession {
+    ) : RendererContentSession {
         override val backendType: RendererType = RendererType.OPENGL_ES_3
 
         override fun resize(width: Int, height: Int) {
@@ -211,6 +221,29 @@ class Gles3RendererBackend : RendererBackend {
             renderThread.setFailureListener(listener)
         }
 
+        override fun setScene(scene: RendererScene) {
+            renderThread.setScene(scene.snapshot(), null)
+        }
+
+        override fun setScene(
+            scene: RendererScene,
+            previousMediaReleased: RendererMediaReleaseListener?
+        ) {
+            renderThread.setScene(scene.snapshot(), previousMediaReleased)
+        }
+
+        override fun updateMotion(motion: RendererMotion) {
+            renderThread.updateMotion(motion)
+        }
+
+        override fun updateSettings(settings: RendererSettings) {
+            renderThread.updateSettings(settings)
+        }
+
+        override fun setEventListener(listener: RendererEventListener?) {
+            renderThread.setEventListener(listener)
+        }
+
         override fun close() {
             renderThread.shutdown()
         }
@@ -218,12 +251,16 @@ class Gles3RendererBackend : RendererBackend {
 
     private class Gles3RenderThread(
         private val surface: Surface,
+        private val mediaAccess: RendererMediaAccess?,
         initiallyPaused: Boolean,
         private val log: (String, String) -> Unit
     ) : Thread("LiveStagix-GLES3") {
         private val startupLatch = CountDownLatch(1)
         private val failureLock = Any()
+        private val commandLock = Any()
         private val mainHandler = Handler(Looper.getMainLooper())
+        private val renderCommands = ConcurrentLinkedQueue<() -> Unit>()
+        private val motionSmoother = RendererMotionTransformSmoother()
 
         @Volatile
         private var stopRequested = false
@@ -250,6 +287,17 @@ class Gles3RendererBackend : RendererBackend {
         private var failureListener: RendererFailureListener? = null
         private var pendingFailure: RendererFailure? = null
 
+        @Volatile
+        private var eventListener: RendererEventListener? = null
+
+        @Volatile
+        private var latestMotion: RendererMotion = RendererMotion.NEUTRAL
+
+        @Volatile
+        private var targetFps: Int = 60
+
+        private var contentController: GlesPhotoContentController? = null
+
         private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
         private var context: EGLContext = EGL14.EGL_NO_CONTEXT
         private var windowSurface: EGLSurface = EGL14.EGL_NO_SURFACE
@@ -259,10 +307,8 @@ class Gles3RendererBackend : RendererBackend {
         private var positionAttribute = -1
         private var texCoordAttribute = -1
         private var textureUniform = -1
-        private var texMatrixUniform = -1
         private var transformUniform = -1
         private var geometryBuffer = 0
-        private var testTexture = 0
 
         fun startAndAwaitReady() {
             start()
@@ -299,14 +345,95 @@ class Gles3RendererBackend : RendererBackend {
         }
 
         fun resize(width: Int, height: Int) {
-            requestedWidth = width.coerceAtLeast(0)
-            requestedHeight = height.coerceAtLeast(0)
-            wakeRenderer()
+            val safeWidth = width.coerceAtLeast(0)
+            val safeHeight = height.coerceAtLeast(0)
+            requestedWidth = safeWidth
+            requestedHeight = safeHeight
+            enqueueRenderCommand { contentController?.resize(safeWidth, safeHeight) }
         }
 
         fun setPaused(value: Boolean) {
             paused = value
-            if (!value) LockSupport.unpark(this)
+            LockSupport.unpark(this)
+        }
+
+        fun setScene(scene: RendererScene, previousMediaReleased: RendererMediaReleaseListener?) {
+            val snapshot = scene.snapshot()
+            enqueueRenderCommand { contentController?.setScene(snapshot, previousMediaReleased) }
+        }
+
+        fun updateMotion(motion: RendererMotion) {
+            latestMotion = motion
+            LockSupport.unpark(this)
+        }
+
+        fun updateSettings(settings: RendererSettings) {
+            enqueueRenderCommand { targetFps = settings.targetFps }
+        }
+
+        fun setEventListener(listener: RendererEventListener?) {
+            eventListener = listener
+        }
+
+        private fun enqueueRenderCommand(command: () -> Unit): Boolean {
+            val accepted = synchronized(commandLock) {
+                if (stopRequested) {
+                    false
+                } else {
+                    renderCommands.add(command)
+                    true
+                }
+            }
+            if (accepted) LockSupport.unpark(this)
+            return accepted
+        }
+
+        private fun drainRenderCommands() {
+            while (true) {
+                val command = renderCommands.poll() ?: return
+                runCatching { command() }.onFailure { error ->
+                    log("ERROR", "GLES 3.0 render command failed: ${error.message}")
+                    dispatchEvent(
+                        RendererEvent.Failure(
+                            RendererFailure(
+                                RendererFailureCategory.UNKNOWN,
+                                error.message ?: "GLES3 render command failed",
+                                "GLES3_RENDER_COMMAND_FAILED"
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        private fun dispatchEvent(event: RendererEvent) {
+            val listener = eventListener ?: return
+            mainHandler.post {
+                if (eventListener === listener) {
+                    runCatching { listener.onRendererEvent(event) }
+                        .onFailure { error ->
+                            log("ERROR", "GLES 3.0 event listener threw: ${error.message}")
+                        }
+                }
+            }
+        }
+
+        private fun dispatchMediaReleased(
+            media: com.livestagix.renderer.api.RendererMedia,
+            listener: RendererMediaReleaseListener?
+        ) {
+            mainHandler.post {
+                val currentListener = eventListener
+                if (currentListener != null) {
+                    runCatching {
+                        currentListener.onRendererEvent(RendererEvent.MediaReleased(media))
+                    }
+                }
+                runCatching { listener?.onReleased(media) }
+                    .onFailure { error ->
+                        log("ERROR", "GLES 3.0 media-release listener threw: ${error.message}")
+                    }
+            }
         }
 
         fun setFailureListener(listener: RendererFailureListener?) {
@@ -320,7 +447,7 @@ class Gles3RendererBackend : RendererBackend {
         }
 
         fun shutdown() {
-            stopRequested = true
+            synchronized(commandLock) { stopRequested = true }
             LockSupport.unpark(this)
             if (Thread.currentThread() !== this) {
                 try {
@@ -441,6 +568,16 @@ class Gles3RendererBackend : RendererBackend {
             val (surfaceWidth, surfaceHeight) = querySurfaceSize()
             requestedWidth = surfaceWidth
             requestedHeight = surfaceHeight
+            contentController = GlesPhotoContentController(
+                mediaAccess = mediaAccess,
+                maxTextureSize = { capabilities?.maxTextureSize ?: 4096 },
+                enqueueRenderCommand = ::enqueueRenderCommand,
+                uploadBitmap = GlesPhotoTexture::upload,
+                deleteTexture = GlesPhotoTexture::release,
+                dispatchEvent = ::dispatchEvent,
+                dispatchMediaReleased = ::dispatchMediaReleased,
+                log = log
+            )
             log(
                 "INFO",
                 "GLES 3.0 context ready: ${capabilities?.deviceName}, " +
@@ -453,13 +590,13 @@ class Gles3RendererBackend : RendererBackend {
             positionAttribute = GLES30.glGetAttribLocation(shaderProgram, "aPosition")
             texCoordAttribute = GLES30.glGetAttribLocation(shaderProgram, "aTexCoord")
             textureUniform = GLES30.glGetUniformLocation(shaderProgram, "uTexture")
-            texMatrixUniform = GLES30.glGetUniformLocation(shaderProgram, "uTexMatrix")
             transformUniform = GLES30.glGetUniformLocation(shaderProgram, "uTransform")
 
-            if (positionAttribute < 0 || texCoordAttribute < 0 ||
-                textureUniform < 0 || texMatrixUniform < 0 || transformUniform < 0
+            if (
+                positionAttribute < 0 || texCoordAttribute < 0 ||
+                textureUniform < 0 || transformUniform < 0
             ) {
-                throw IllegalStateException("GLES 3.0 shader interface is incomplete")
+                throw IllegalStateException("GLES 3.0 photo shader interface is incomplete")
             }
 
             val vertexData = floatBuffer(QUAD_VERTICES)
@@ -477,53 +614,11 @@ class Gles3RendererBackend : RendererBackend {
             )
             GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
 
-            val textureIds = IntArray(1)
-            GLES30.glGenTextures(1, textureIds, 0)
-            testTexture = textureIds[0]
-            if (testTexture == 0) throw IllegalStateException("Could not allocate 2D test texture")
-
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, testTexture)
-            GLES30.glTexParameteri(
-                GLES30.GL_TEXTURE_2D,
-                GLES30.GL_TEXTURE_MIN_FILTER,
-                GLES30.GL_LINEAR
-            )
-            GLES30.glTexParameteri(
-                GLES30.GL_TEXTURE_2D,
-                GLES30.GL_TEXTURE_MAG_FILTER,
-                GLES30.GL_LINEAR
-            )
-            GLES30.glTexParameteri(
-                GLES30.GL_TEXTURE_2D,
-                GLES30.GL_TEXTURE_WRAP_S,
-                GLES30.GL_CLAMP_TO_EDGE
-            )
-            GLES30.glTexParameteri(
-                GLES30.GL_TEXTURE_2D,
-                GLES30.GL_TEXTURE_WRAP_T,
-                GLES30.GL_CLAMP_TO_EDGE
-            )
-
-            val pixels = ByteBuffer.allocateDirect(TEST_TEXTURE_PIXELS.size)
-                .order(ByteOrder.nativeOrder())
-                .put(TEST_TEXTURE_PIXELS)
-                .apply { position(0) }
-            GLES30.glTexImage2D(
-                GLES30.GL_TEXTURE_2D,
-                0,
-                GLES30.GL_RGBA,
-                TEST_TEXTURE_WIDTH,
-                TEST_TEXTURE_HEIGHT,
-                0,
-                GLES30.GL_RGBA,
-                GLES30.GL_UNSIGNED_BYTE,
-                pixels
-            )
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
-
             val error = GLES30.glGetError()
             if (error != GLES30.GL_NO_ERROR) {
-                throw IllegalStateException("GLES 3.0 resource setup failed: 0x${error.toString(16)}")
+                throw IllegalStateException(
+                    "GLES 3.0 photo resource setup failed: 0x${error.toString(16)}"
+                )
             }
         }
 
@@ -579,76 +674,92 @@ class Gles3RendererBackend : RendererBackend {
 
         private fun renderLoop() {
             while (!stopRequested) {
+                drainRenderCommands()
+                if (stopRequested) break
                 if (paused) {
                     LockSupport.parkNanos(PAUSED_POLL_INTERVAL_NS)
                     continue
                 }
 
                 val frameStartNs = System.nanoTime()
-                renderFrame()
+                renderFrame(frameStartNs)
                 val frameDurationNs = System.nanoTime() - frameStartNs
-                val remainingNs = DEFAULT_FRAME_INTERVAL_NS - frameDurationNs
+                val frameIntervalNs = 1_000_000_000L / targetFps.coerceIn(1, 240)
+                val remainingNs = frameIntervalNs - frameDurationNs
                 if (remainingNs > 0L) LockSupport.parkNanos(remainingNs)
             }
         }
 
-        private fun renderFrame() {
+        private fun renderFrame(frameStartNanos: Long) {
             val width = requestedWidth
             val height = requestedHeight
             if (width <= 0 || height <= 0) return
 
             GLES30.glViewport(0, 0, width, height)
-            GLES30.glClearColor(0.02f, 0.04f, 0.08f, 1f)
+            GLES30.glClearColor(0f, 0f, 0f, 1f)
             GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
 
-            GLES30.glUseProgram(shaderProgram)
-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, testTexture)
-            GLES30.glUniform1i(textureUniform, 0)
-            GLES30.glUniformMatrix4fv(
-                texMatrixUniform,
-                1,
-                false,
-                IDENTITY_MATRIX,
-                0
-            )
-            GLES30.glUniformMatrix4fv(
-                transformUniform,
-                1,
-                false,
-                IDENTITY_MATRIX,
-                0
-            )
+            val photoTexture = contentController?.textureId ?: 0
+            if (photoTexture != 0) {
+                val motion = latestMotion
+                val transform = motionSmoother.update(
+                    motion,
+                    width,
+                    height,
+                    timestampNanos = frameStartNanos
+                )
+                val matrix = GlesMotionMatrix.build(
+                    transform,
+                    width,
+                    height,
+                    motion.configuration.threeDimensionalEnabled
+                )
 
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, geometryBuffer)
-            GLES30.glEnableVertexAttribArray(positionAttribute)
-            GLES30.glVertexAttribPointer(
-                positionAttribute,
-                2,
-                GLES30.GL_FLOAT,
-                false,
-                QUAD_VERTEX_STRIDE_BYTES,
-                0
-            )
-            GLES30.glEnableVertexAttribArray(texCoordAttribute)
-            GLES30.glVertexAttribPointer(
-                texCoordAttribute,
-                2,
-                GLES30.GL_FLOAT,
-                false,
-                QUAD_VERTEX_STRIDE_BYTES,
-                QUAD_TEX_COORD_OFFSET_BYTES
-            )
-            GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, QUAD_VERTEX_COUNT)
+                GLES30.glUseProgram(shaderProgram)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, photoTexture)
+                GLES30.glUniform1i(textureUniform, 0)
+                GLES30.glUniformMatrix4fv(transformUniform, 1, false, matrix, 0)
 
-            GLES30.glDisableVertexAttribArray(positionAttribute)
-            GLES30.glDisableVertexAttribArray(texCoordAttribute)
-            GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
-            GLES30.glUseProgram(0)
+                GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, geometryBuffer)
+                GLES30.glEnableVertexAttribArray(positionAttribute)
+                GLES30.glVertexAttribPointer(
+                    positionAttribute,
+                    2,
+                    GLES30.GL_FLOAT,
+                    false,
+                    QUAD_VERTEX_STRIDE_BYTES,
+                    0
+                )
+                GLES30.glEnableVertexAttribArray(texCoordAttribute)
+                GLES30.glVertexAttribPointer(
+                    texCoordAttribute,
+                    2,
+                    GLES30.GL_FLOAT,
+                    false,
+                    QUAD_VERTEX_STRIDE_BYTES,
+                    QUAD_TEX_COORD_OFFSET_BYTES
+                )
+                GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, QUAD_VERTEX_COUNT)
+                GLES30.glDisableVertexAttribArray(positionAttribute)
+                GLES30.glDisableVertexAttribArray(texCoordAttribute)
+                GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+                GLES30.glUseProgram(0)
+            }
 
+            val error = GLES30.glGetError()
+            if (error != GLES30.GL_NO_ERROR) {
+                throw IllegalStateException(
+                    "GLES 3.0 frame rendering failed: 0x${error.toString(16)}"
+                )
+            }
             if (!EGL14.eglSwapBuffers(display, windowSurface)) {
                 throw eglException("eglSwapBuffers failed", startup = false)
+            }
+
+            contentController?.currentMedia?.let { media ->
+                if (photoTexture != 0) dispatchEvent(RendererEvent.FramePresented(media))
             }
         }
 
@@ -737,7 +848,7 @@ class Gles3RendererBackend : RendererBackend {
                 }
             }
             if (listener != null) dispatchFailure(listener, failure)
-            stopRequested = true
+            synchronized(commandLock) { stopRequested = true }
             LockSupport.unpark(this)
         }
 
@@ -764,9 +875,9 @@ class Gles3RendererBackend : RendererBackend {
                     EGL14.eglMakeCurrent(display, windowSurface, windowSurface, context)
 
                 if (contextCurrent) {
-                    if (testTexture != 0) {
-                        GLES30.glDeleteTextures(1, intArrayOf(testTexture), 0)
-                    }
+                    drainRenderCommands()
+                    contentController?.close()
+                    contentController = null
                     if (geometryBuffer != 0) {
                         GLES30.glDeleteBuffers(1, intArrayOf(geometryBuffer), 0)
                     }
@@ -792,7 +903,6 @@ class Gles3RendererBackend : RendererBackend {
             windowSurface = EGL14.EGL_NO_SURFACE
             context = EGL14.EGL_NO_CONTEXT
             display = EGL14.EGL_NO_DISPLAY
-            testTexture = 0
             geometryBuffer = 0
             shaderProgram = 0
             eglInitialized = false
@@ -801,47 +911,29 @@ class Gles3RendererBackend : RendererBackend {
         companion object {
             private const val STARTUP_TIMEOUT_SECONDS = 10L
             private const val SHUTDOWN_TIMEOUT_MILLIS = 5_000L
-            private const val DEFAULT_FRAME_INTERVAL_NS = 16_666_667L
             private const val PAUSED_POLL_INTERVAL_NS = 100_000_000L
-            private const val TEST_TEXTURE_WIDTH = 2
-            private const val TEST_TEXTURE_HEIGHT = 2
             private const val QUAD_VERTEX_COUNT = 6
             private const val QUAD_VERTEX_STRIDE_BYTES = 4 * Float.SIZE_BYTES
             private const val QUAD_TEX_COORD_OFFSET_BYTES = 2 * Float.SIZE_BYTES
 
             private val QUAD_VERTICES = floatArrayOf(
-                -1f, -1f, 0f, 0f,
-                 1f, -1f, 1f, 0f,
-                -1f,  1f, 0f, 1f,
-                 1f, -1f, 1f, 0f,
-                 1f,  1f, 1f, 1f,
-                -1f,  1f, 0f, 1f
-            )
-
-            private val TEST_TEXTURE_PIXELS = byteArrayOf(
-                0x16, 0x45, 0x86.toByte(), 0xFF.toByte(),
-                0x58, 0x8B.toByte(), 0xC7.toByte(), 0xFF.toByte(),
-                0x70, 0x42, 0x9B.toByte(), 0xFF.toByte(),
-                0x27, 0x72, 0xA2.toByte(), 0xFF.toByte()
-            )
-
-            private val IDENTITY_MATRIX = floatArrayOf(
-                1f, 0f, 0f, 0f,
-                0f, 1f, 0f, 0f,
-                0f, 0f, 1f, 0f,
-                0f, 0f, 0f, 1f
+                -1f, -1f, 0f, 1f,
+                 1f, -1f, 1f, 1f,
+                -1f,  1f, 0f, 0f,
+                 1f, -1f, 1f, 1f,
+                 1f,  1f, 1f, 0f,
+                -1f,  1f, 0f, 0f
             )
 
             private val VERTEX_SHADER = """
                 #version 300 es
                 in vec2 aPosition;
                 in vec2 aTexCoord;
-                uniform mat4 uTexMatrix;
                 uniform mat4 uTransform;
                 out vec2 vTexCoord;
                 void main() {
                     gl_Position = uTransform * vec4(aPosition, 0.0, 1.0);
-                    vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
+                    vTexCoord = aTexCoord;
                 }
             """.trimIndent()
 
@@ -919,7 +1011,13 @@ class Gles3RendererBackend : RendererBackend {
                 driverVersion = null,
                 extensions = extensions,
                 features = features,
-                maxTextureSize = maxTextureSize[0].takeIf { it > 0 }
+                maxTextureSize = maxTextureSize[0].takeIf { it > 0 },
+                contentFeatures = setOf(
+                    RendererContentFeature.PHOTO,
+                    RendererContentFeature.MOTION_2D,
+                    RendererContentFeature.MOTION_3D,
+                    RendererContentFeature.MOTION_ROTATION
+                )
             )
         }
     

@@ -12,18 +12,27 @@ import android.os.Looper
 import android.view.Surface
 import com.livestagix.renderer.api.RendererBackend
 import com.livestagix.renderer.api.RendererCapabilities
+import com.livestagix.renderer.api.RendererContentFeature
+import com.livestagix.renderer.api.RendererContentSession
 import com.livestagix.renderer.api.RendererCreateRequest
+import com.livestagix.renderer.api.RendererEvent
+import com.livestagix.renderer.api.RendererEventListener
+import com.livestagix.renderer.api.RendererMediaAccess
+import com.livestagix.renderer.api.RendererMediaReleaseListener
+import com.livestagix.renderer.api.RendererMotion
+import com.livestagix.renderer.api.RendererScene
+import com.livestagix.renderer.api.RendererSettings
 import com.livestagix.renderer.api.RendererException
 import com.livestagix.renderer.api.RendererFailure
 import com.livestagix.renderer.api.RendererFailureCategory
 import com.livestagix.renderer.api.RendererFailureListener
 import com.livestagix.renderer.api.RendererFeature
 import com.livestagix.renderer.api.RendererLogListener
-import com.livestagix.renderer.api.RendererSession
 import com.livestagix.renderer.api.RendererSupportResult
 import com.livestagix.renderer.api.RendererType
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
@@ -32,8 +41,8 @@ import java.util.concurrent.locks.LockSupport
  * Independent OpenGL ES 2.0 backend.
  *
  * This is the compatibility baseline: its own EGL ES2 context, shader program,
- * fullscreen quad and surface presentation loop. It does not request an ES3 context
- * and does not claim photo, video, motion or post-processing support yet.
+ * photo texture upload, motion transform and surface presentation loop. Video,
+ * effects, frame generation and Smart Upscale remain separate implementation stages.
  */
 class Gles2RendererBackend : RendererBackend {
     override val type: RendererType = RendererType.OPENGL_ES_2
@@ -75,6 +84,7 @@ class Gles2RendererBackend : RendererBackend {
 
         val renderThread = Gles2RenderThread(
             surface = request.surface,
+            mediaAccess = request.mediaAccess,
             initiallyPaused = request.config.initiallyPaused,
             log = ::log
         )
@@ -170,7 +180,7 @@ class Gles2RendererBackend : RendererBackend {
     private class Gles2RendererSession(
         private val renderThread: Gles2RenderThread,
         override val capabilities: RendererCapabilities
-    ) : RendererSession {
+    ) : RendererContentSession {
         override val backendType: RendererType = RendererType.OPENGL_ES_2
 
         override fun resize(width: Int, height: Int) {
@@ -185,6 +195,29 @@ class Gles2RendererBackend : RendererBackend {
             renderThread.setFailureListener(listener)
         }
 
+        override fun setScene(scene: RendererScene) {
+            renderThread.setScene(scene.snapshot(), null)
+        }
+
+        override fun setScene(
+            scene: RendererScene,
+            previousMediaReleased: RendererMediaReleaseListener?
+        ) {
+            renderThread.setScene(scene.snapshot(), previousMediaReleased)
+        }
+
+        override fun updateMotion(motion: RendererMotion) {
+            renderThread.updateMotion(motion)
+        }
+
+        override fun updateSettings(settings: RendererSettings) {
+            renderThread.updateSettings(settings)
+        }
+
+        override fun setEventListener(listener: RendererEventListener?) {
+            renderThread.setEventListener(listener)
+        }
+
         override fun close() {
             renderThread.shutdown()
         }
@@ -192,12 +225,16 @@ class Gles2RendererBackend : RendererBackend {
 
     private class Gles2RenderThread(
         private val surface: Surface,
+        private val mediaAccess: RendererMediaAccess?,
         initiallyPaused: Boolean,
         private val log: (String, String) -> Unit
     ) : Thread("LiveStagix-GLES2") {
         private val startupLatch = CountDownLatch(1)
         private val failureLock = Any()
+        private val commandLock = Any()
         private val mainHandler = Handler(Looper.getMainLooper())
+        private val renderCommands = ConcurrentLinkedQueue<() -> Unit>()
+        private val motionSmoother = com.livestagix.renderer.pipeline.RendererMotionTransformSmoother()
 
         @Volatile
         private var stopRequested = false
@@ -224,13 +261,26 @@ class Gles2RendererBackend : RendererBackend {
         private var failureListener: RendererFailureListener? = null
         private var pendingFailure: RendererFailure? = null
 
+        @Volatile
+        private var eventListener: RendererEventListener? = null
+
+        @Volatile
+        private var latestMotion: RendererMotion = RendererMotion.NEUTRAL
+
+        @Volatile
+        private var targetFps: Int = 60
+
+        private var contentController: GlesPhotoContentController? = null
+
         private var display: EGLDisplay = EGL14.EGL_NO_DISPLAY
         private var context: EGLContext = EGL14.EGL_NO_CONTEXT
         private var windowSurface: EGLSurface = EGL14.EGL_NO_SURFACE
         private var eglInitialized = false
         private var program = 0
         private var positionAttribute = -1
-        private var resolutionUniform = -1
+        private var texCoordAttribute = -1
+        private var textureUniform = -1
+        private var transformUniform = -1
         private var vertexBuffer = 0
 
         fun startAndAwaitReady() {
@@ -271,12 +321,91 @@ class Gles2RendererBackend : RendererBackend {
             if (width <= 0 || height <= 0) return
             requestedWidth = width
             requestedHeight = height
-            LockSupport.unpark(this)
+            enqueueRenderCommand { contentController?.resize(width, height) }
         }
 
         fun setPaused(value: Boolean) {
             paused = value
             LockSupport.unpark(this)
+        }
+
+        fun setScene(scene: RendererScene, previousMediaReleased: RendererMediaReleaseListener?) {
+            val snapshot = scene.snapshot()
+            enqueueRenderCommand { contentController?.setScene(snapshot, previousMediaReleased) }
+        }
+
+        fun updateMotion(motion: RendererMotion) {
+            latestMotion = motion
+            LockSupport.unpark(this)
+        }
+
+        fun updateSettings(settings: RendererSettings) {
+            enqueueRenderCommand { targetFps = settings.targetFps }
+        }
+
+        fun setEventListener(listener: RendererEventListener?) {
+            eventListener = listener
+        }
+
+        private fun enqueueRenderCommand(command: () -> Unit): Boolean {
+            val accepted = synchronized(commandLock) {
+                if (stopRequested) {
+                    false
+                } else {
+                    renderCommands.add(command)
+                    true
+                }
+            }
+            if (accepted) LockSupport.unpark(this)
+            return accepted
+        }
+
+        private fun drainRenderCommands() {
+            while (true) {
+                val command = renderCommands.poll() ?: return
+                runCatching { command() }.onFailure { error ->
+                    log("ERROR", "GLES 2.0 render command failed: " + error.message)
+                    dispatchEvent(
+                        RendererEvent.Failure(
+                            RendererFailure(
+                                RendererFailureCategory.UNKNOWN,
+                                error.message ?: "GLES2 render command failed",
+                                "GLES2_RENDER_COMMAND_FAILED"
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        private fun dispatchEvent(event: RendererEvent) {
+            val listener = eventListener ?: return
+            mainHandler.post {
+                if (eventListener === listener) {
+                    runCatching { listener.onRendererEvent(event) }
+                        .onFailure { error ->
+                            log("ERROR", "GLES 2.0 event listener threw: " + error.message)
+                        }
+                }
+            }
+        }
+
+        private fun dispatchMediaReleased(
+            media: com.livestagix.renderer.api.RendererMedia,
+            listener: RendererMediaReleaseListener?
+        ) {
+            mainHandler.post {
+                val currentListener = eventListener
+                if (currentListener != null) {
+                    runCatching {
+                        currentListener.onRendererEvent(RendererEvent.MediaReleased(media))
+                    }
+                }
+                runCatching { listener?.onReleased(media) }
+                    .onFailure { error ->
+                        log("ERROR", "GLES 2.0 media-release listener threw: " + error.message)
+                    }
+            }
         }
 
         fun setFailureListener(listener: RendererFailureListener?) {
@@ -288,7 +417,7 @@ class Gles2RendererBackend : RendererBackend {
         }
 
         fun shutdown() {
-            stopRequested = true
+            synchronized(commandLock) { stopRequested = true }
             LockSupport.unpark(this)
             if (isAlive && Thread.currentThread() !== this) {
                 try {
@@ -405,6 +534,16 @@ class Gles2RendererBackend : RendererBackend {
             requestedWidth = size.first
             requestedHeight = size.second
             createGraphicsResources()
+            contentController = GlesPhotoContentController(
+                mediaAccess = mediaAccess,
+                maxTextureSize = { capabilities?.maxTextureSize ?: 4096 },
+                enqueueRenderCommand = ::enqueueRenderCommand,
+                uploadBitmap = GlesPhotoTexture::upload,
+                deleteTexture = GlesPhotoTexture::release,
+                dispatchEvent = ::dispatchEvent,
+                dispatchMediaReleased = ::dispatchMediaReleased,
+                log = log
+            )
             log(
                 "INFO",
                 "GLES 2.0 context ready: " + capabilities?.deviceName +
@@ -416,9 +555,14 @@ class Gles2RendererBackend : RendererBackend {
         private fun createGraphicsResources() {
             program = createProgram(VERTEX_SHADER, FRAGMENT_SHADER)
             positionAttribute = GLES20.glGetAttribLocation(program, "aPosition")
-            resolutionUniform = GLES20.glGetUniformLocation(program, "uResolution")
-            if (positionAttribute < 0 || resolutionUniform < 0) {
-                throw IllegalStateException("GLES 2.0 shader is missing a required input")
+            texCoordAttribute = GLES20.glGetAttribLocation(program, "aTexCoord")
+            textureUniform = GLES20.glGetUniformLocation(program, "uTexture")
+            transformUniform = GLES20.glGetUniformLocation(program, "uTransform")
+            if (
+                positionAttribute < 0 || texCoordAttribute < 0 ||
+                textureUniform < 0 || transformUniform < 0
+            ) {
+                throw IllegalStateException("GLES 2.0 photo shader is missing a required input")
             }
 
             val buffers = IntArray(1)
@@ -437,7 +581,7 @@ class Gles2RendererBackend : RendererBackend {
                 GLES20.GL_STATIC_DRAW
             )
             GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-            checkGlError("GLES 2.0 resource setup")
+            checkGlError("GLES 2.0 photo resource setup")
         }
 
         private fun createProgram(vertexSource: String, fragmentSource: String): Int {
@@ -491,44 +635,85 @@ class Gles2RendererBackend : RendererBackend {
 
         private fun renderLoop() {
             while (!stopRequested) {
+                drainRenderCommands()
+                if (stopRequested) break
                 if (paused) {
                     LockSupport.parkNanos(PAUSED_POLL_INTERVAL_NS)
                     continue
                 }
 
                 val frameStart = System.nanoTime()
-                renderFrame()
-                val remaining = FRAME_INTERVAL_NS - (System.nanoTime() - frameStart)
+                renderFrame(frameStart)
+                val frameInterval = 1_000_000_000L / targetFps.coerceIn(1, 240)
+                val remaining = frameInterval - (System.nanoTime() - frameStart)
                 if (remaining > 0L) LockSupport.parkNanos(remaining)
             }
         }
 
-        private fun renderFrame() {
+        private fun renderFrame(frameStartNanos: Long) {
             val width = requestedWidth
             val height = requestedHeight
             if (width <= 0 || height <= 0) return
 
             GLES20.glViewport(0, 0, width, height)
-            GLES20.glUseProgram(program)
-            GLES20.glUniform2f(resolutionUniform, width.toFloat(), height.toFloat())
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer)
-            GLES20.glEnableVertexAttribArray(positionAttribute)
-            GLES20.glVertexAttribPointer(
-                positionAttribute,
-                2,
-                GLES20.GL_FLOAT,
-                false,
-                0,
-                0
-            )
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-            GLES20.glDisableVertexAttribArray(positionAttribute)
-            GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
-            GLES20.glUseProgram(0)
-            checkGlError("GLES 2.0 frame rendering")
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
 
+            val photoTexture = contentController?.textureId ?: 0
+            if (photoTexture != 0) {
+                val motion = latestMotion
+                val transform = motionSmoother.update(
+                    motion,
+                    width,
+                    height,
+                    timestampNanos = frameStartNanos
+                )
+                val matrix = GlesMotionMatrix.build(
+                    transform,
+                    width,
+                    height,
+                    motion.configuration.threeDimensionalEnabled
+                )
+
+                GLES20.glUseProgram(program)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, photoTexture)
+                GLES20.glUniform1i(textureUniform, 0)
+                GLES20.glUniformMatrix4fv(transformUniform, 1, false, matrix, 0)
+                GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vertexBuffer)
+                GLES20.glEnableVertexAttribArray(positionAttribute)
+                GLES20.glVertexAttribPointer(
+                    positionAttribute,
+                    2,
+                    GLES20.GL_FLOAT,
+                    false,
+                    QUAD_VERTEX_STRIDE_BYTES,
+                    0
+                )
+                GLES20.glEnableVertexAttribArray(texCoordAttribute)
+                GLES20.glVertexAttribPointer(
+                    texCoordAttribute,
+                    2,
+                    GLES20.GL_FLOAT,
+                    false,
+                    QUAD_VERTEX_STRIDE_BYTES,
+                    QUAD_TEX_COORD_OFFSET_BYTES
+                )
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, QUAD_VERTEX_COUNT)
+                GLES20.glDisableVertexAttribArray(positionAttribute)
+                GLES20.glDisableVertexAttribArray(texCoordAttribute)
+                GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+                GLES20.glUseProgram(0)
+            }
+
+            checkGlError("GLES 2.0 frame rendering")
             if (!EGL14.eglSwapBuffers(display, windowSurface)) {
                 throw eglException("eglSwapBuffers failed", startup = false)
+            }
+
+            contentController?.currentMedia?.let { media ->
+                if (photoTexture != 0) dispatchEvent(RendererEvent.FramePresented(media))
             }
         }
 
@@ -618,9 +803,10 @@ class Gles2RendererBackend : RendererBackend {
                     context != EGL14.EGL_NO_CONTEXT &&
                     EGL14.eglMakeCurrent(display, windowSurface, windowSurface, context)
 
-            // A partially initialized context may never have become current. In that case,
-            // destroying the EGL context releases any resources created before the failure.
             if (canReleaseGlResources) {
+                drainRenderCommands()
+                contentController?.close()
+                contentController = null
                 if (program != 0) {
                     GLES20.glDeleteProgram(program)
                     program = 0
@@ -660,9 +846,43 @@ class Gles2RendererBackend : RendererBackend {
         const val EGL_OPENGL_ES2_BIT = 0x0004
         const val STARTUP_TIMEOUT_SECONDS = 10L
         const val SHUTDOWN_TIMEOUT_MS = 3_000L
-        const val FRAME_INTERVAL_NS = 16_666_667L
         const val PAUSED_POLL_INTERVAL_NS = 100_000_000L
+        private const val QUAD_VERTEX_COUNT = 6
+        private const val QUAD_VERTEX_STRIDE_BYTES = 4 * Float.SIZE_BYTES
+        private const val QUAD_TEX_COORD_OFFSET_BYTES = 2 * Float.SIZE_BYTES
 
+        val CONTENT_FEATURES = setOf(
+            RendererContentFeature.PHOTO,
+            RendererContentFeature.MOTION_2D,
+            RendererContentFeature.MOTION_3D,
+            RendererContentFeature.MOTION_ROTATION
+        )
+        private val QUAD_VERTICES = floatArrayOf(
+            -1f, -1f, 0f, 1f,
+             1f, -1f, 1f, 1f,
+            -1f,  1f, 0f, 0f,
+             1f, -1f, 1f, 1f,
+             1f,  1f, 1f, 0f,
+            -1f,  1f, 0f, 0f
+        )
+        private val VERTEX_SHADER = """
+            attribute vec2 aPosition;
+            attribute vec2 aTexCoord;
+            uniform mat4 uTransform;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = uTransform * vec4(aPosition, 0.0, 1.0);
+                vTexCoord = aTexCoord;
+            }
+        """.trimIndent()
+        private val FRAGMENT_SHADER = """
+            precision mediump float;
+            uniform sampler2D uTexture;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_FragColor = texture2D(uTexture, vTexCoord);
+            }
+        """.trimIndent()
         val ES2_CONFIG_ATTRIBUTES = intArrayOf(
             EGL14.EGL_RED_SIZE, 8,
             EGL14.EGL_GREEN_SIZE, 8,
@@ -684,32 +904,6 @@ class Gles2RendererBackend : RendererBackend {
         val WINDOW_SURFACE_ATTRIBUTES = intArrayOf(EGL14.EGL_NONE)
         val VERSION_REGEX = Regex("""OpenGL ES\s+(\d+)\.(\d+)""")
         val WHITESPACE_REGEX = Regex("""\s+""")
-        val QUAD_VERTICES = floatArrayOf(
-            -1f, -1f,
-            1f, -1f,
-            -1f, 1f,
-            1f, 1f
-        )
-        val VERTEX_SHADER = """
-            attribute vec2 aPosition;
-            void main() {
-                gl_Position = vec4(aPosition, 0.0, 1.0);
-            }
-        """.trimIndent()
-        val FRAGMENT_SHADER = """
-            precision mediump float;
-            uniform vec2 uResolution;
-            void main() {
-                vec2 uv = gl_FragCoord.xy / max(uResolution, vec2(1.0));
-                gl_FragColor = vec4(
-                    0.025 + uv.x * 0.04,
-                    0.035 + uv.y * 0.06,
-                    0.09 + uv.x * 0.12,
-                    1.0
-                );
-            }
-        """.trimIndent()
-
         private fun chooseEs2Config(display: EGLDisplay): EGLConfig? {
             val configs = arrayOfNulls<EGLConfig>(1)
             val count = IntArray(1)
@@ -754,7 +948,8 @@ class Gles2RendererBackend : RendererBackend {
                 apiVersion = version,
                 extensions = extensions,
                 features = features,
-                maxTextureSize = maxTextureSize[0].takeIf { it > 0 }
+                maxTextureSize = maxTextureSize[0].takeIf { it > 0 },
+                contentFeatures = CONTENT_FEATURES
             )
         }
 

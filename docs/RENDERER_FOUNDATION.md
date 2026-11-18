@@ -22,8 +22,8 @@ media access and a small environment snapshot through RendererCreateRequest.
 | Backend | Current baseline | Not yet claimed |
 | --- | --- | --- |
 | Vulkan | Native device, surface, swapchain, pipeline and diagnostic frame | Photo/video scene, motion, effects, FI, SU |
-| OpenGL ES 3.0 | EGL ES3 context, textured quad and presentation loop | Photo/video scene, motion, effects, FI, SU |
-| OpenGL ES 2.0 | Independent EGL ES2 context, shader program, fullscreen quad and presentation loop | Photo/video scene, motion, effects, FI, SU |
+| OpenGL ES 3.0 | EGL ES3 context, photo texture upload/rendering, 2D/3D/rotation motion | Video, effects, FI, SU |
+| OpenGL ES 2.0 | Independent EGL ES2 context, photo texture upload/rendering, 2D/3D/rotation motion | Video, effects, FI, SU |
 
 All three backend capability objects intentionally leave contentFeatures empty until a complete
 end-to-end feature path is implemented and tested. Low-level GPU extensions are not proof that a
@@ -32,13 +32,14 @@ wallpaper feature works.
 ## Shared foundations added
 
 - **Photo:** RendererPhotoDecoder performs CPU decode, sampling, orientation and cover-crop.
-  Backend-specific GPU texture upload, filtering, and texture lifecycle are still required.
+  GLES2 and GLES3 now upload the decoded bitmap on their own EGL threads, replace/delete
+  photo textures safely, and redraw the image through backend-specific shaders.
 - **Video:** RendererMediaAccess and RendererVideoDecoder define host access and decoder
   boundaries. GLES2/3 need a SurfaceTexture/external-OES import path; Vulkan needs an
   AImageReader/HardwareBuffer and Vulkan external-memory path. These are not interchangeable.
-- **Motion:** RendererMotionTransformCalculator supplies a backend-neutral 2D/3D/rotation
-  transform and edge-safe scale, plus an exponential smoother. It is a first pass, not full
-  parity with LiveWP's per-axis auto-stabilisation and rate limiter.
+- **Motion:** RendererMotionTransformSmoother supplies the LiveWP-derived per-axis smoothing,
+  auto-stabilisation, edge-safety and rate limiting. GLES2 and GLES3 apply the shared result
+  through independent 2D or perspective 3D transform matrices.
 - **Effects:** RendererEffectCatalog preserves pulse_halo and reactor_core. Their existing
   LiveWP GLES20 shaders must be ported independently to GLES2, GLES3 and Vulkan pipelines.
 - **Frame generation:** RendererFrameGenerationAnalyzer estimates CPU luma block motion.
@@ -54,7 +55,8 @@ wallpaper feature works.
 
 1. Keep LiveWP's current GpuWallpaperRenderer as the app-side fallback. Do not run it alongside
    a new Effects session for the same wallpaper surface.
-2. Implement photo upload and motion application independently in GLES2, GLES3 and Vulkan.
+2. Complete the remaining photo upload and motion path in Vulkan; GLES2 and GLES3 now expose
+   content sessions for photos and motion.
 3. Add the GLES SurfaceTexture/external-OES video path and the Vulkan HardwareBuffer path.
 4. Port Pulse Halo and Reactor Core shader passes to each backend.
 5. Add backend-specific FI interpolation and SU shader passes, with explicit feature checks.

@@ -84,7 +84,11 @@ class RendererManager(backends: Collection<RendererBackend>) {
                     continue
                 }
 
-                return RendererManagedSession(session, attempts.toList())
+                return if (session is RendererContentSession) {
+                    RendererManagedContentSession(session, attempts.toList())
+                } else {
+                    RendererManagedSession(session, attempts.toList())
+                }
             } catch (error: Exception) {
                 runCatching { session?.close() }
                 val failure = (error as? RendererException)?.failure
@@ -103,6 +107,26 @@ class RendererManager(backends: Collection<RendererBackend>) {
 
         throw RendererManagerException(attempts.toList())
     }
+
+    fun createContentSession(
+        context: Context,
+        request: RendererCreateRequest,
+        policy: RendererSelectionPolicy = RendererSelectionPolicy()
+    ): RendererManagedContentSession {
+        val session = createSession(context, request, policy)
+        return session as? RendererManagedContentSession
+            ?: run {
+                session.close()
+                throw RendererException(
+                    RendererFailure(
+                        RendererFailureCategory.MISSING_REQUIRED_FEATURE,
+                        "The selected backend does not expose a content session",
+                        "RENDERER_CONTENT_SESSION_UNAVAILABLE"
+                    )
+                )
+            }
+    }
+
 }
 
 /** Explicit selection and fallback policy. */
@@ -146,7 +170,7 @@ class RendererManagerException(
 )
 
 /** A managed session, retaining the failures that led to the selected backend. */
-class RendererManagedSession internal constructor(
+open class RendererManagedSession internal constructor(
     private val delegate: RendererSession,
     val fallbackAttempts: List<RendererBackendAttempt>
 ) : RendererSession {
@@ -170,8 +194,43 @@ class RendererManagedSession internal constructor(
         if (!closed.get()) delegate.setFailureListener(listener)
     }
 
+    protected fun isOpen(): Boolean = !closed.get()
+
     override fun close() {
         if (closed.compareAndSet(false, true)) delegate.close()
+    }
+}
+
+/** Content-aware wrapper that preserves scene and motion access after backend selection. */
+class RendererManagedContentSession internal constructor(
+    private val contentDelegate: RendererContentSession,
+    fallbackAttempts: List<RendererBackendAttempt>
+) : RendererManagedSession(contentDelegate, fallbackAttempts), RendererContentSession {
+    override fun setScene(scene: RendererScene) {
+        if (isOpen()) contentDelegate.setScene(scene.snapshot())
+    }
+
+    override fun setScene(
+        scene: RendererScene,
+        previousMediaReleased: RendererMediaReleaseListener?
+    ) {
+        if (isOpen()) contentDelegate.setScene(scene.snapshot(), previousMediaReleased)
+    }
+
+    override fun updateMotion(motion: RendererMotion) {
+        if (isOpen()) contentDelegate.updateMotion(motion)
+    }
+
+    override fun updateSettings(settings: RendererSettings) {
+        if (isOpen()) contentDelegate.updateSettings(settings)
+    }
+
+    override fun setPlaybackPaused(paused: Boolean) {
+        if (isOpen()) contentDelegate.setPlaybackPaused(paused)
+    }
+
+    override fun setEventListener(listener: RendererEventListener?) {
+        if (isOpen()) contentDelegate.setEventListener(listener)
     }
 }
 
