@@ -21,6 +21,14 @@ class RendererManager(backends: Collection<RendererBackend>) {
         context: Context,
         request: RendererCreateRequest,
         policy: RendererSelectionPolicy = RendererSelectionPolicy()
+    ): RendererManagedSession =
+        createSessionInternal(context, request, policy, requireContentSession = false)
+
+    private fun createSessionInternal(
+        context: Context,
+        request: RendererCreateRequest,
+        policy: RendererSelectionPolicy,
+        requireContentSession: Boolean
     ): RendererManagedSession {
         val attempts = mutableListOf<RendererBackendAttempt>()
 
@@ -64,6 +72,21 @@ class RendererManager(backends: Collection<RendererBackend>) {
                             "RENDERER_BACKEND_TYPE_MISMATCH"
                         )
                     )
+                }
+
+                if (requireContentSession && session !is RendererContentSession) {
+                    session.close()
+                    session = null
+                    attempts += RendererBackendAttempt(
+                        backendType = type,
+                        supportResult = support,
+                        failure = RendererFailure(
+                            RendererFailureCategory.MISSING_REQUIRED_FEATURE,
+                            "Backend " + type + " does not expose a content session",
+                            "RENDERER_CONTENT_SESSION_UNAVAILABLE"
+                        )
+                    )
+                    continue
                 }
 
                 val availableFeatures = session.capabilities?.contentFeatures.orEmpty()
@@ -112,20 +135,9 @@ class RendererManager(backends: Collection<RendererBackend>) {
         context: Context,
         request: RendererCreateRequest,
         policy: RendererSelectionPolicy = RendererSelectionPolicy()
-    ): RendererManagedContentSession {
-        val session = createSession(context, request, policy)
-        return session as? RendererManagedContentSession
-            ?: run {
-                session.close()
-                throw RendererException(
-                    RendererFailure(
-                        RendererFailureCategory.MISSING_REQUIRED_FEATURE,
-                        "The selected backend does not expose a content session",
-                        "RENDERER_CONTENT_SESSION_UNAVAILABLE"
-                    )
-                )
-            }
-    }
+    ): RendererManagedContentSession =
+        createSessionInternal(context, request, policy, requireContentSession = true)
+            as RendererManagedContentSession
 
 }
 
