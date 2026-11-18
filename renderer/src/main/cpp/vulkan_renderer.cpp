@@ -346,6 +346,7 @@ struct QueueFamilies {
     uint32_t graphics = UINT32_MAX;
     uint32_t present = UINT32_MAX;
     uint32_t graphicsTimestampValidBits = 0;
+    bool computeQueueAvailable = false;
 
     bool complete() const {
         return graphics != UINT32_MAX && present != UINT32_MAX;
@@ -852,6 +853,9 @@ private:
                     candidateFamilies.graphicsTimestampValidBits =
                         families[index].timestampValidBits;
                 }
+                if ((families[index].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+                    candidateFamilies.computeQueueAvailable = true;
+                }
 
                 VkBool32 canPresent = VK_FALSE;
                 requireVk(
@@ -909,9 +913,7 @@ private:
         }
 
         deviceExtensions_ = getDeviceExtensionNames(physicalDevice_);
-        VkPhysicalDeviceFeatures supportedFeatures{};
-        vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
-        computeShadersSupported_ = supportedFeatures.computeShader == VK_TRUE;
+        computeShadersSupported_ = queueFamilies_.computeQueueAvailable;
 
         emitLog(
             "INFO",
@@ -2676,19 +2678,22 @@ std::vector<std::string> inspectVulkanSupport() {
 
         uint32_t timestampValidBits = 0;
         bool hasGraphicsQueue = false;
+        bool hasComputeQueue = false;
         for (const VkQueueFamilyProperties& queue : queues) {
             if ((queue.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                if (!hasGraphicsQueue) {
+                    timestampValidBits = queue.timestampValidBits;
+                }
                 hasGraphicsQueue = true;
-                timestampValidBits = queue.timestampValidBits;
-                break;
+            }
+            if ((queue.queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+                hasComputeQueue = true;
             }
         }
         if (!hasGraphicsQueue) continue;
 
         VkPhysicalDeviceProperties properties{};
-        VkPhysicalDeviceFeatures features{};
         vkGetPhysicalDeviceProperties(device, &properties);
-        vkGetPhysicalDeviceFeatures(device, &features);
 
         const bool timestampsSupported =
             timestampValidBits > 0 && properties.limits.timestampPeriod > 0.0f;
@@ -2696,7 +2701,7 @@ std::vector<std::string> inspectVulkanSupport() {
             properties,
             extensions,
             timestampsSupported,
-            features.computeShader == VK_TRUE
+            hasComputeQueue
         );
         vkDestroyInstance(instance, nullptr);
         return supportResponse("SUPPORTED", "", "", "", capabilities);
