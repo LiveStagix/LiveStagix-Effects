@@ -6,6 +6,7 @@ import com.livestagix.renderer.api.RendererBackend
 import com.livestagix.renderer.api.RendererCreateConfig
 import com.livestagix.renderer.api.RendererCreateRequest
 import com.livestagix.renderer.api.RendererFailureCategory
+import com.livestagix.renderer.api.RendererFailureListener
 import com.livestagix.renderer.api.RendererException
 import com.livestagix.renderer.api.RendererSession
 import com.livestagix.renderer.backends.vulkan.VulkanRendererBackend
@@ -75,6 +76,15 @@ class VulkanWallpaperService : WallpaperService() {
                     )
                 )
                 startedSession = session
+                session.setFailureListener(RendererFailureListener { failure ->
+                    EventRecorder.record(
+                        "ERROR",
+                        "WALLPAPER",
+                        "Renderer runtime failure: engine=${engineId}, " +
+                            "backend=${session.backendType}, category=${failure.category}, " +
+                            "code=${failure.diagnosticCode ?: "none"}, message=${failure.message}"
+                    )
+                })
                 rendererSession = session
                 EventRecorder.record(
                     "INFO",

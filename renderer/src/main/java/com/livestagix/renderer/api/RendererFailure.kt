@@ -9,6 +9,7 @@ enum class RendererFailureCategory(val isPermanentForDevice: Boolean) {
     BACKEND_UNAVAILABLE(false),
     SURFACE_UNAVAILABLE(false),
     RESOURCE_UNAVAILABLE(false),
+    DEVICE_LOST(false),
     INITIALIZATION_FAILED(false),
     TEMPORARY_FAILURE(false),
     UNKNOWN(false)

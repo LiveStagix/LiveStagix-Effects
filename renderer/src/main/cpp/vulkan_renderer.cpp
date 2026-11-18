@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -23,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -78,6 +80,7 @@ void appendTimingStats(
 JavaVM* gJavaVm = nullptr;
 jclass gRendererBridgeClass = nullptr;
 jmethodID gNativeLogMethod = nullptr;
+jmethodID gNativeFailureMethod = nullptr;
 
 void emitLog(const char* level, const std::string& message) {
     int priority = ANDROID_LOG_INFO;
@@ -125,6 +128,53 @@ void emitLog(const char* level, const std::string& message) {
     if (attachedHere) gJavaVm->DetachCurrentThread();
 }
 
+void emitNativeFailure(
+    jlong rendererHandle,
+    const std::string& category,
+    const std::string& diagnosticCode,
+    const std::string& message
+) {
+    if (gJavaVm == nullptr ||
+        gRendererBridgeClass == nullptr ||
+        gNativeFailureMethod == nullptr) {
+        return;
+    }
+
+    JNIEnv* env = nullptr;
+    bool attachedHere = false;
+    const jint getEnvResult = gJavaVm->GetEnv(
+        reinterpret_cast<void**>(&env),
+        JNI_VERSION_1_6
+    );
+
+    if (getEnvResult == JNI_EDETACHED) {
+        if (gJavaVm->AttachCurrentThread(&env, nullptr) != JNI_OK) return;
+        attachedHere = true;
+    } else if (getEnvResult != JNI_OK) {
+        return;
+    }
+
+    jstring javaCategory = env->NewStringUTF(category.c_str());
+    jstring javaCode = env->NewStringUTF(diagnosticCode.c_str());
+    jstring javaMessage = env->NewStringUTF(message.c_str());
+    if (javaCategory != nullptr && javaCode != nullptr && javaMessage != nullptr) {
+        env->CallStaticVoidMethod(
+            gRendererBridgeClass,
+            gNativeFailureMethod,
+            rendererHandle,
+            javaCategory,
+            javaCode,
+            javaMessage
+        );
+    }
+
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (javaCategory != nullptr) env->DeleteLocalRef(javaCategory);
+    if (javaCode != nullptr) env->DeleteLocalRef(javaCode);
+    if (javaMessage != nullptr) env->DeleteLocalRef(javaMessage);
+    if (attachedHere) gJavaVm->DetachCurrentThread();
+}
+
 std::string vkVersionString(uint32_t version) {
     std::ostringstream stream;
     stream << VK_VERSION_MAJOR(version) << "."
@@ -160,9 +210,55 @@ std::string vkResultString(VkResult result) {
     }
 }
 
+class VulkanRendererException final : public std::runtime_error {
+public:
+    VulkanRendererException(
+        std::string category,
+        std::string diagnosticCode,
+        std::string message
+    )
+        : std::runtime_error(std::move(message)),
+          category_(std::move(category)),
+          diagnosticCode_(std::move(diagnosticCode)) {
+    }
+
+    const std::string& category() const { return category_; }
+    const std::string& diagnosticCode() const { return diagnosticCode_; }
+
+private:
+    std::string category_;
+    std::string diagnosticCode_;
+};
+
+std::pair<std::string, std::string> classifyVkResult(VkResult result) {
+    switch (result) {
+        case VK_ERROR_INCOMPATIBLE_DRIVER:
+            return {"DRIVER_INCOMPATIBLE", "VULKAN_INCOMPATIBLE_DRIVER"};
+        case VK_ERROR_FEATURE_NOT_PRESENT:
+        case VK_ERROR_EXTENSION_NOT_PRESENT:
+        case VK_ERROR_FORMAT_NOT_SUPPORTED:
+            return {"MISSING_REQUIRED_FEATURE", "VULKAN_REQUIRED_FEATURE_UNAVAILABLE"};
+        case VK_ERROR_DEVICE_LOST:
+            return {"DEVICE_LOST", "VULKAN_DEVICE_LOST"};
+        case VK_ERROR_OUT_OF_HOST_MEMORY:
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY:
+        case VK_ERROR_MEMORY_MAP_FAILED:
+            return {"RESOURCE_UNAVAILABLE", "VULKAN_RESOURCE_UNAVAILABLE"};
+        case VK_ERROR_SURFACE_LOST_KHR:
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            return {"SURFACE_UNAVAILABLE", "VULKAN_SURFACE_UNAVAILABLE"};
+        default:
+            return {"INITIALIZATION_FAILED", "VULKAN_OPERATION_FAILED"};
+    }
+}
+
 void requireVk(VkResult result, const char* operation) {
     if (result != VK_SUCCESS) {
-        throw std::runtime_error(
+        const auto failure = classifyVkResult(result);
+        throw VulkanRendererException(
+            failure.first,
+            failure.second,
             std::string(operation) + " failed: " + vkResultString(result)
         );
     }
@@ -170,14 +266,19 @@ void requireVk(VkResult result, const char* operation) {
 
 bool hasInstanceExtension(const char* name) {
     uint32_t count = 0;
-    if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS) {
-        return false;
-    }
+    requireVk(
+        vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr),
+        "vkEnumerateInstanceExtensionProperties(count)"
+    );
 
     std::vector<VkExtensionProperties> extensions(count);
-    if (count > 0 && vkEnumerateInstanceExtensionProperties(
-            nullptr, &count, extensions.data()) != VK_SUCCESS) {
-        return false;
+    if (count > 0) {
+        requireVk(
+            vkEnumerateInstanceExtensionProperties(
+                nullptr, &count, extensions.data()
+            ),
+            "vkEnumerateInstanceExtensionProperties(list)"
+        );
     }
 
     return std::any_of(
@@ -191,14 +292,19 @@ bool hasInstanceExtension(const char* name) {
 
 bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
     uint32_t count = 0;
-    if (vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr) != VK_SUCCESS) {
-        return false;
-    }
+    requireVk(
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr),
+        "vkEnumerateDeviceExtensionProperties(count)"
+    );
 
     std::vector<VkExtensionProperties> extensions(count);
-    if (count > 0 && vkEnumerateDeviceExtensionProperties(
-            device, nullptr, &count, extensions.data()) != VK_SUCCESS) {
-        return false;
+    if (count > 0) {
+        requireVk(
+            vkEnumerateDeviceExtensionProperties(
+                device, nullptr, &count, extensions.data()
+            ),
+            "vkEnumerateDeviceExtensionProperties(list)"
+        );
     }
 
     return std::any_of(
@@ -208,6 +314,32 @@ bool hasDeviceExtension(VkPhysicalDevice device, const char* name) {
             return std::strcmp(extension.extensionName, name) == 0;
         }
     );
+}
+
+std::vector<std::string> getDeviceExtensionNames(VkPhysicalDevice device) {
+    uint32_t count = 0;
+    requireVk(
+        vkEnumerateDeviceExtensionProperties(device, nullptr, &count, nullptr),
+        "vkEnumerateDeviceExtensionProperties(count)"
+    );
+
+    std::vector<VkExtensionProperties> properties(count);
+    if (count > 0) {
+        requireVk(
+            vkEnumerateDeviceExtensionProperties(
+                device, nullptr, &count, properties.data()
+            ),
+            "vkEnumerateDeviceExtensionProperties(list)"
+        );
+    }
+
+    std::vector<std::string> names;
+    names.reserve(properties.size());
+    for (const VkExtensionProperties& property : properties) {
+        names.emplace_back(property.extensionName);
+    }
+    std::sort(names.begin(), names.end());
+    return names;
 }
 
 struct QueueFamilies {
@@ -227,10 +359,32 @@ struct FrameResources {
     bool timestampPending = false;
 };
 
+std::vector<std::string> makeCapabilityFields(
+    const VkPhysicalDeviceProperties& properties,
+    const std::vector<std::string>& extensions,
+    bool timestampQueriesSupported,
+    bool computeShadersSupported
+) {
+    std::vector<std::string> fields = {
+        properties.deviceName,
+        vkVersionString(properties.apiVersion),
+        std::to_string(properties.driverVersion),
+        std::to_string(properties.limits.maxImageDimension2D),
+        timestampQueriesSupported ? "true" : "false",
+        computeShadersSupported ? "true" : "false"
+    };
+    fields.insert(fields.end(), extensions.begin(), extensions.end());
+    return fields;
+}
+
 class VulkanRenderer {
 public:
-    VulkanRenderer(ANativeWindow* window, AAssetManager* assets)
-        : window_(window), assets_(assets) {
+    VulkanRenderer(
+        jlong rendererHandle,
+        ANativeWindow* window,
+        AAssetManager* assets
+    )
+        : rendererHandle_(rendererHandle), window_(window), assets_(assets) {
     }
 
     ~VulkanRenderer() {
@@ -244,6 +398,19 @@ public:
     void start() {
         stopRequested_.store(false);
         renderThread_ = std::thread(&VulkanRenderer::threadMain, this);
+
+        std::unique_lock<std::mutex> lock(startupMutex_);
+        startupCondition_.wait(lock, [this] { return startupFinished_; });
+
+        if (startupSucceeded_) return;
+
+        const std::string category = startupFailureCategory_;
+        const std::string diagnosticCode = startupFailureCode_;
+        const std::string message = startupFailureMessage_;
+        lock.unlock();
+
+        stop();
+        throw VulkanRendererException(category, diagnosticCode, message);
     }
 
     void stop() {
@@ -311,12 +478,48 @@ public:
         paused_.store(paused);
     }
 
+    std::vector<std::string> capabilityFields() const {
+        return makeCapabilityFields(
+            deviceProperties_,
+            deviceExtensions_,
+            timestampQueriesSupported_,
+            computeShadersSupported_
+        );
+    }
+
 private:
+    void completeStartup(
+        bool succeeded,
+        const std::string& category = "",
+        const std::string& diagnosticCode = "",
+        const std::string& message = ""
+    ) {
+        {
+            std::lock_guard<std::mutex> lock(startupMutex_);
+            if (startupFinished_) return;
+            startupSucceeded_ = succeeded;
+            startupFailureCategory_ = category;
+            startupFailureCode_ = diagnosticCode;
+            startupFailureMessage_ = message;
+            startupFinished_ = true;
+        }
+        startupCondition_.notify_all();
+    }
+
+    const jlong rendererHandle_;
     ANativeWindow* window_ = nullptr;
     AAssetManager* assets_ = nullptr;
     std::thread renderThread_;
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> paused_{false};
+
+    std::mutex startupMutex_;
+    std::condition_variable startupCondition_;
+    bool startupFinished_ = false;
+    bool startupSucceeded_ = false;
+    std::string startupFailureCategory_ = "INITIALIZATION_FAILED";
+    std::string startupFailureCode_ = "VULKAN_INITIALIZATION_FAILED";
+    std::string startupFailureMessage_ = "Vulkan initialization did not complete";
 
     std::mutex resizeMutex_;
     int pendingResizeWidth_ = 0;
@@ -354,6 +557,8 @@ private:
     uint32_t timestampValidBits_ = 0;
     double timestampPeriodNs_ = 0.0;
     bool timestampQueriesSupported_ = false;
+    bool computeShadersSupported_ = false;
+    std::vector<std::string> deviceExtensions_;
 
     static uint64_t processCpuTimeNs() {
         timespec cpuTime{};
@@ -418,9 +623,12 @@ private:
 
     void threadMain() {
         emitLog("INFO", "Native Vulkan render thread started");
+        bool initializationCompleted = false;
 
         try {
             initialize();
+            initializationCompleted = true;
+            completeStartup(true);
             emitLog(
                 "INFO",
                 "READY: " + std::string(deviceProperties_.deviceName) +
@@ -429,10 +637,58 @@ private:
                     std::to_string(swapchainExtent_.height)
             );
             renderLoop();
+        } catch (const VulkanRendererException& error) {
+            if (initializationCompleted) {
+                emitNativeFailure(
+                    rendererHandle_,
+                    error.category(),
+                    error.diagnosticCode(),
+                    error.what()
+                );
+            } else {
+                completeStartup(
+                    false,
+                    error.category(),
+                    error.diagnosticCode(),
+                    error.what()
+                );
+            }
+            emitLog("ERROR", error.what());
         } catch (const std::exception& error) {
+            if (initializationCompleted) {
+                emitNativeFailure(
+                    rendererHandle_,
+                    "TEMPORARY_FAILURE",
+                    "VULKAN_RUNTIME_FAILURE",
+                    error.what()
+                );
+            } else {
+                completeStartup(
+                    false,
+                    "INITIALIZATION_FAILED",
+                    "VULKAN_INITIALIZATION_FAILED",
+                    error.what()
+                );
+            }
             emitLog("ERROR", error.what());
         } catch (...) {
-            emitLog("ERROR", "Unknown native renderer failure");
+            const std::string message = "Unknown native renderer failure";
+            if (initializationCompleted) {
+                emitNativeFailure(
+                    rendererHandle_,
+                    "UNKNOWN",
+                    "VULKAN_UNKNOWN_RUNTIME_FAILURE",
+                    message
+                );
+            } else {
+                completeStartup(
+                    false,
+                    "INITIALIZATION_FAILED",
+                    "VULKAN_UNKNOWN_INITIALIZATION_FAILURE",
+                    message
+                );
+            }
+            emitLog("ERROR", message);
         }
 
         shutdown();
@@ -469,10 +725,18 @@ private:
 
     void createInstance() {
         if (!hasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
-            throw std::runtime_error("Required instance extension VK_KHR_surface is unavailable");
+            throw VulkanRendererException(
+                "MISSING_REQUIRED_FEATURE",
+                "VULKAN_SURFACE_EXTENSION_MISSING",
+                "Required instance extension VK_KHR_surface is unavailable"
+            );
         }
         if (!hasInstanceExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
-            throw std::runtime_error("Required instance extension VK_KHR_android_surface is unavailable");
+            throw VulkanRendererException(
+                "MISSING_REQUIRED_FEATURE",
+                "VULKAN_ANDROID_SURFACE_EXTENSION_MISSING",
+                "Required instance extension VK_KHR_android_surface is unavailable"
+            );
         }
 
         uint32_t layerCount = 0;
@@ -542,7 +806,9 @@ private:
         );
 
         if (deviceCount == 0) {
-            throw std::runtime_error(
+            throw VulkanRendererException(
+                "UNSUPPORTED_DEVICE",
+                "VULKAN_NO_PHYSICAL_DEVICE",
                 "Vulkan instance exists, but the runtime reported zero physical devices"
             );
         }
@@ -610,11 +876,17 @@ private:
 
             uint32_t formatCount = 0;
             uint32_t modeCount = 0;
-            vkGetPhysicalDeviceSurfaceFormatsKHR(
-                candidate, surface_, &formatCount, nullptr
+            requireVk(
+                vkGetPhysicalDeviceSurfaceFormatsKHR(
+                    candidate, surface_, &formatCount, nullptr
+                ),
+                "vkGetPhysicalDeviceSurfaceFormatsKHR(count)"
             );
-            vkGetPhysicalDeviceSurfacePresentModesKHR(
-                candidate, surface_, &modeCount, nullptr
+            requireVk(
+                vkGetPhysicalDeviceSurfacePresentModesKHR(
+                    candidate, surface_, &modeCount, nullptr
+                ),
+                "vkGetPhysicalDeviceSurfacePresentModesKHR(count)"
             );
 
             if (formatCount == 0 || modeCount == 0) {
@@ -629,10 +901,17 @@ private:
         }
 
         if (physicalDevice_ == VK_NULL_HANDLE) {
-            throw std::runtime_error(
+            throw VulkanRendererException(
+                "UNSUPPORTED_DEVICE",
+                "VULKAN_NO_COMPATIBLE_DEVICE",
                 "No physical device supports graphics, Android presentation and VK_KHR_swapchain"
             );
         }
+
+        deviceExtensions_ = getDeviceExtensionNames(physicalDevice_);
+        VkPhysicalDeviceFeatures supportedFeatures{};
+        vkGetPhysicalDeviceFeatures(physicalDevice_, &supportedFeatures);
+        computeShadersSupported_ = supportedFeatures.computeShader == VK_TRUE;
 
         emitLog(
             "INFO",
@@ -2220,6 +2499,218 @@ private:
     }
 };
 
+void throwJavaRendererFailure(
+    JNIEnv* env,
+    const std::string& category,
+    const std::string& diagnosticCode,
+    const std::string& message
+) {
+    std::ostringstream payload;
+    payload << "LIVESTAGIX_RENDERER_FAILURE|"
+            << category << "|"
+            << diagnosticCode << "|"
+            << message;
+
+    jclass exceptionClass = env->FindClass("java/lang/IllegalStateException");
+    if (exceptionClass != nullptr) {
+        env->ThrowNew(exceptionClass, payload.str().c_str());
+        env->DeleteLocalRef(exceptionClass);
+    }
+}
+
+jobjectArray toJavaStringArray(
+    JNIEnv* env,
+    const std::vector<std::string>& values
+) {
+    jclass stringClass = env->FindClass("java/lang/String");
+    if (stringClass == nullptr) return nullptr;
+
+    jobjectArray result = env->NewObjectArray(
+        static_cast<jsize>(values.size()),
+        stringClass,
+        nullptr
+    );
+    env->DeleteLocalRef(stringClass);
+    if (result == nullptr) return nullptr;
+
+    for (size_t index = 0; index < values.size(); ++index) {
+        jstring value = env->NewStringUTF(values[index].c_str());
+        if (value == nullptr) return nullptr;
+        env->SetObjectArrayElement(result, static_cast<jsize>(index), value);
+        env->DeleteLocalRef(value);
+        if (env->ExceptionCheck()) return nullptr;
+    }
+    return result;
+}
+
+std::vector<std::string> supportResponse(
+    const std::string& status,
+    const std::string& category = "",
+    const std::string& diagnosticCode = "",
+    const std::string& message = "",
+    const std::vector<std::string>& capabilities = {}
+) {
+    std::vector<std::string> response = {
+        status, category, diagnosticCode, message
+    };
+    response.insert(response.end(), capabilities.begin(), capabilities.end());
+    return response;
+}
+
+std::vector<std::string> inspectVulkanSupport() {
+    if (!hasInstanceExtension(VK_KHR_SURFACE_EXTENSION_NAME)) {
+        return supportResponse(
+            "UNSUPPORTED",
+            "MISSING_REQUIRED_FEATURE",
+            "VULKAN_SURFACE_EXTENSION_MISSING",
+            "Vulkan loader does not expose VK_KHR_surface"
+        );
+    }
+    if (!hasInstanceExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
+        return supportResponse(
+            "UNSUPPORTED",
+            "MISSING_REQUIRED_FEATURE",
+            "VULKAN_ANDROID_SURFACE_EXTENSION_MISSING",
+            "Vulkan loader does not expose VK_KHR_android_surface"
+        );
+    }
+
+    const char* requiredExtensions[] = {
+        VK_KHR_SURFACE_EXTENSION_NAME,
+        VK_KHR_ANDROID_SURFACE_EXTENSION_NAME
+    };
+
+    VkApplicationInfo applicationInfo{};
+    applicationInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    applicationInfo.pApplicationName = "LiveStagix Vulkan Support Probe";
+    applicationInfo.applicationVersion = 1;
+    applicationInfo.pEngineName = "LiveStagix Renderer";
+    applicationInfo.engineVersion = 1;
+    applicationInfo.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    createInfo.pApplicationInfo = &applicationInfo;
+    createInfo.enabledExtensionCount = 2;
+    createInfo.ppEnabledExtensionNames = requiredExtensions;
+
+    VkInstance instance = VK_NULL_HANDLE;
+    const VkResult instanceResult = vkCreateInstance(&createInfo, nullptr, &instance);
+    if (instanceResult != VK_SUCCESS) {
+        const auto failure = classifyVkResult(instanceResult);
+        const std::string status =
+            failure.first == "DRIVER_INCOMPATIBLE" ||
+            failure.first == "MISSING_REQUIRED_FEATURE"
+                ? "UNSUPPORTED"
+                : "NOT_CHECKED";
+        return supportResponse(
+            status,
+            failure.first,
+            failure.second,
+            "Vulkan support probe could not create an instance: " +
+                vkResultString(instanceResult)
+        );
+    }
+
+    uint32_t deviceCount = 0;
+    VkResult result = vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
+    if (result != VK_SUCCESS) {
+        vkDestroyInstance(instance, nullptr);
+        return supportResponse(
+            "NOT_CHECKED",
+            "UNKNOWN",
+            "VULKAN_DEVICE_ENUMERATION_FAILED",
+            vkResultString(result)
+        );
+    }
+    if (deviceCount == 0) {
+        vkDestroyInstance(instance, nullptr);
+        return supportResponse(
+            "UNSUPPORTED",
+            "UNSUPPORTED_DEVICE",
+            "VULKAN_NO_PHYSICAL_DEVICE",
+            "The Vulkan runtime reports no physical devices"
+        );
+    }
+
+    std::vector<VkPhysicalDevice> devices(deviceCount);
+    result = vkEnumeratePhysicalDevices(instance, &deviceCount, devices.data());
+    if (result != VK_SUCCESS) {
+        vkDestroyInstance(instance, nullptr);
+        return supportResponse(
+            "NOT_CHECKED",
+            "UNKNOWN",
+            "VULKAN_DEVICE_ENUMERATION_FAILED",
+            vkResultString(result)
+        );
+    }
+
+    for (VkPhysicalDevice device : devices) {
+        std::vector<std::string> extensions;
+        try {
+            extensions = getDeviceExtensionNames(device);
+        } catch (const std::exception& error) {
+            vkDestroyInstance(instance, nullptr);
+            return supportResponse(
+                "NOT_CHECKED",
+                "UNKNOWN",
+                "VULKAN_EXTENSION_ENUMERATION_FAILED",
+                error.what()
+            );
+        }
+
+        if (std::find(
+                extensions.begin(),
+                extensions.end(),
+                VK_KHR_SWAPCHAIN_EXTENSION_NAME
+            ) == extensions.end()) {
+            continue;
+        }
+
+        uint32_t queueCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(device, &queueCount, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(queueCount);
+        if (queueCount > 0) {
+            vkGetPhysicalDeviceQueueFamilyProperties(device, &queueCount, queues.data());
+        }
+
+        uint32_t timestampValidBits = 0;
+        bool hasGraphicsQueue = false;
+        for (const VkQueueFamilyProperties& queue : queues) {
+            if ((queue.queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                hasGraphicsQueue = true;
+                timestampValidBits = queue.timestampValidBits;
+                break;
+            }
+        }
+        if (!hasGraphicsQueue) continue;
+
+        VkPhysicalDeviceProperties properties{};
+        VkPhysicalDeviceFeatures features{};
+        vkGetPhysicalDeviceProperties(device, &properties);
+        vkGetPhysicalDeviceFeatures(device, &features);
+
+        const bool timestampsSupported =
+            timestampValidBits > 0 && properties.limits.timestampPeriod > 0.0f;
+        auto capabilities = makeCapabilityFields(
+            properties,
+            extensions,
+            timestampsSupported,
+            features.computeShader == VK_TRUE
+        );
+        vkDestroyInstance(instance, nullptr);
+        return supportResponse("SUPPORTED", "", "", "", capabilities);
+    }
+
+    vkDestroyInstance(instance, nullptr);
+    return supportResponse(
+        "UNSUPPORTED",
+        "UNSUPPORTED_DEVICE",
+        "VULKAN_NO_COMPATIBLE_DEVICE",
+        "No physical device exposes a graphics queue and VK_KHR_swapchain"
+    );
+}
+
 std::mutex gRendererMutex;
 std::unordered_map<jlong, std::unique_ptr<VulkanRenderer>> gRenderers;
 std::atomic<jlong> gNextRendererHandle{1};
@@ -2256,7 +2747,63 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
         return JNI_ERR;
     }
 
+    gNativeFailureMethod = env->GetStaticMethodID(
+        gRendererBridgeClass,
+        "onNativeFailure",
+        "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+    );
+    if (gNativeFailureMethod == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return JNI_ERR;
+    }
+
     return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_livestagix_renderer_NativeVulkanRenderer_nativeInspectSupport(
+    JNIEnv* env,
+    jobject
+) {
+    try {
+        return toJavaStringArray(env, inspectVulkanSupport());
+    } catch (const std::exception& error) {
+        return toJavaStringArray(
+            env,
+            supportResponse(
+                "NOT_CHECKED",
+                "UNKNOWN",
+                "VULKAN_SUPPORT_PROBE_FAILED",
+                error.what()
+            )
+        );
+    } catch (...) {
+        return toJavaStringArray(
+            env,
+            supportResponse(
+                "NOT_CHECKED",
+                "UNKNOWN",
+                "VULKAN_SUPPORT_PROBE_FAILED",
+                "Unknown Vulkan support probe failure"
+            )
+        );
+    }
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_livestagix_renderer_NativeVulkanRenderer_nativeGetCapabilities(
+    JNIEnv* env,
+    jobject,
+    jlong handle
+) {
+    std::vector<std::string> fields;
+    {
+        std::lock_guard<std::mutex> lock(gRendererMutex);
+        const auto renderer = gRenderers.find(handle);
+        if (renderer == gRenderers.end()) return nullptr;
+        fields = renderer->second->capabilityFields();
+    }
+    return toJavaStringArray(env, fields);
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -2268,14 +2815,28 @@ Java_com_livestagix_renderer_NativeVulkanRenderer_nativeStart(
 ) {
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
     if (window == nullptr) {
-        emitLog("ERROR", "ANativeWindow_fromSurface returned null");
+        const std::string message = "ANativeWindow_fromSurface returned null";
+        emitLog("ERROR", message);
+        throwJavaRendererFailure(
+            env,
+            "SURFACE_UNAVAILABLE",
+            "VULKAN_ANDROID_WINDOW_UNAVAILABLE",
+            message
+        );
         return 0;
     }
 
     AAssetManager* assets = AAssetManager_fromJava(env, assetManager);
     if (assets == nullptr) {
         ANativeWindow_release(window);
-        emitLog("ERROR", "AAssetManager_fromJava returned null");
+        const std::string message = "AAssetManager_fromJava returned null";
+        emitLog("ERROR", message);
+        throwJavaRendererFailure(
+            env,
+            "RESOURCE_UNAVAILABLE",
+            "VULKAN_ASSET_MANAGER_UNAVAILABLE",
+            message
+        );
         return 0;
     }
 
@@ -2283,7 +2844,7 @@ Java_com_livestagix_renderer_NativeVulkanRenderer_nativeStart(
     std::unique_ptr<VulkanRenderer> renderer;
 
     try {
-        renderer = std::make_unique<VulkanRenderer>(window, assets);
+        renderer = std::make_unique<VulkanRenderer>(handle, window, assets);
         window = nullptr; // Ownership moves to VulkanRenderer.
         renderer->start();
 
@@ -2297,19 +2858,45 @@ Java_com_livestagix_renderer_NativeVulkanRenderer_nativeStart(
 
         emitLog("INFO", "Vulkan renderer started for engine handle " + std::to_string(handle));
         return handle;
+    } catch (const VulkanRendererException& error) {
+        if (window != nullptr) ANativeWindow_release(window);
+        emitLog(
+            "ERROR",
+            "Could not initialize Vulkan renderer handle " + std::to_string(handle) +
+                ": " + error.what()
+        );
+        throwJavaRendererFailure(
+            env,
+            error.category(),
+            error.diagnosticCode(),
+            error.what()
+        );
     } catch (const std::exception& error) {
         if (window != nullptr) ANativeWindow_release(window);
         emitLog(
             "ERROR",
-            "Could not start Vulkan renderer handle " + std::to_string(handle) +
+            "Could not initialize Vulkan renderer handle " + std::to_string(handle) +
                 ": " + error.what()
+        );
+        throwJavaRendererFailure(
+            env,
+            "INITIALIZATION_FAILED",
+            "VULKAN_NATIVE_START_FAILED",
+            error.what()
         );
     } catch (...) {
         if (window != nullptr) ANativeWindow_release(window);
+        const std::string message = "Unknown native renderer startup failure";
         emitLog(
             "ERROR",
-            "Could not start Vulkan renderer handle " + std::to_string(handle) +
-                ": unknown native error"
+            "Could not initialize Vulkan renderer handle " + std::to_string(handle) +
+                ": " + message
+        );
+        throwJavaRendererFailure(
+            env,
+            "INITIALIZATION_FAILED",
+            "VULKAN_UNKNOWN_NATIVE_START_FAILURE",
+            message
         );
     }
 

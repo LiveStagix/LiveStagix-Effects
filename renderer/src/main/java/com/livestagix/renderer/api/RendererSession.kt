@@ -14,5 +14,8 @@ interface RendererSession : AutoCloseable {
 
     fun setPaused(paused: Boolean)
 
+    /** Receives terminal backend failures that occur after session creation. */
+    fun setFailureListener(listener: RendererFailureListener?)
+
     override fun close()
 }
