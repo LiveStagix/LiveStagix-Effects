@@ -22,6 +22,7 @@ import com.livestagix.renderer.api.RendererMediaReleaseListener
 import com.livestagix.renderer.api.RendererMotion
 import com.livestagix.renderer.api.RendererScene
 import com.livestagix.renderer.api.RendererSettings
+import com.livestagix.renderer.api.RendererSession
 import com.livestagix.renderer.pipeline.RendererMotionTransformSmoother
 import com.livestagix.renderer.api.RendererException
 import com.livestagix.renderer.api.RendererFailure
