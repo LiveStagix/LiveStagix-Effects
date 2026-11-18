@@ -157,7 +157,7 @@ jobs:
           ls -lh "$MAPPING_PATH"
 
           echo "Macrobenchmark test APKs:"
-          find macrobenchmark/build/outputs/apk -type f -name "*.apk" -print -exec ls -lh {} ;
+          find macrobenchmark/build/outputs/apk -type f -name "*.apk" -print
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
