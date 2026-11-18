@@ -47,10 +47,12 @@ jobs:
           glslc --target-env=vulkan1.0 renderer/src/main/shaders/triangle.frag -o renderer/src/main/assets/shaders/triangle.frag.spv
           glslc --target-env=vulkan1.0 renderer/src/main/shaders/vortex.vert -o renderer/src/main/assets/shaders/vortex.vert.spv
           glslc --target-env=vulkan1.0 renderer/src/main/shaders/vortex.frag -o renderer/src/main/assets/shaders/vortex.frag.spv
+          glslc --target-env=vulkan1.0 renderer/src/main/shaders/baseline.frag -o renderer/src/main/assets/shaders/baseline.frag.spv
           test -s renderer/src/main/assets/shaders/triangle.vert.spv
           test -s renderer/src/main/assets/shaders/triangle.frag.spv
           test -s renderer/src/main/assets/shaders/vortex.vert.spv
           test -s renderer/src/main/assets/shaders/vortex.frag.spv
+          test -s renderer/src/main/assets/shaders/baseline.frag.spv
 
       - name: Install Android build components
         run: |

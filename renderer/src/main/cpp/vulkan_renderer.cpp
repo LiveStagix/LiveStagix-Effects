@@ -1121,7 +1121,7 @@ private:
 
     void createGraphicsPipeline() {
         const std::vector<uint32_t> vertexCode = loadShader("shaders/vortex.vert.spv");
-        const std::vector<uint32_t> fragmentCode = loadShader("shaders/vortex.frag.spv");
+        const std::vector<uint32_t> fragmentCode = loadShader("shaders/baseline.frag.spv");
 
         VkShaderModule vertexModule = createShaderModule(vertexCode);
         VkShaderModule fragmentModule = VK_NULL_HANDLE;
@@ -1249,7 +1249,7 @@ private:
 
         vkDestroyShaderModule(device_, fragmentModule, nullptr);
         vkDestroyShaderModule(device_, vertexModule, nullptr);
-        emitLog("INFO", "Aurora Vortex graphics pipeline created from precompiled SPIR-V shaders");
+        emitLog("INFO", "Baseline diagnostic graphics pipeline created from precompiled SPIR-V shaders");
     }
 
     void createFramebuffers() {
